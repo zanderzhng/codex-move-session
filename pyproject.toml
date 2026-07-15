@@ -1,0 +1,58 @@
+[project]
+name = "codex-move-session"
+version = "0.1.0"
+description = "Repair local Codex sessions after moving a project directory"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "zz", email = "zanderzhng@gmail.com" }]
+keywords = ["codex", "migration", "sessions", "uvx"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "psutil>=6.0",
+    "questionary>=2.1",
+    "rich>=13.9",
+]
+
+[project.urls]
+Homepage = "https://github.com/zanderzhng/codex-move-session"
+Repository = "https://github.com/zanderzhng/codex-move-session"
+Issues = "https://github.com/zanderzhng/codex-move-session/issues"
+
+[project.scripts]
+codex-move-session = "codex_move_session.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.9.0,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.9",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
