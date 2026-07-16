@@ -26,10 +26,19 @@ from .delete import (
 )
 from .planner import DatabaseChange, MigrationPlan
 from .windows_file import (
+    create_file_exclusive_at as _create_windows_file_exclusive,
+)
+from .windows_file import (
     delete_file_by_fd as _delete_windows_file,
 )
 from .windows_file import (
     open_file_for_delete as _open_windows_delete_fd,
+)
+from .windows_file import (
+    open_file_for_update as _open_windows_update_fd,
+)
+from .windows_file import (
+    write_file_by_fd as _write_windows_file,
 )
 
 
@@ -84,6 +93,12 @@ class _OpenPlannedFile:
         if self.parent_fd >= 0:
             os.close(self.parent_fd)
             self.parent_fd = -1
+
+
+@dataclass(frozen=True)
+class _MutationState:
+    identity: tuple[int, int]
+    applied: bool
 
 
 def _supports_secure_dir_fd() -> bool:
@@ -307,6 +322,8 @@ def _open_planned_file(
             name = path.name
             if deletion is not None and _uses_windows_handle_delete():
                 file_fd = _open_windows_delete_fd(path)
+            elif deletion is None and _uses_windows_handle_delete():
+                file_fd = _open_windows_update_fd(path)
             else:
                 file_fd = os.open(path, file_flags)
             path_info = path.lstat()
@@ -545,12 +562,25 @@ def _remove_file(path: Path, *, dir_fd: int | None = None) -> None:
     os.unlink(path, dir_fd=dir_fd)
 
 
+def _replace_file(source: str | Path, destination: str | Path, **kwargs: Any) -> None:
+    os.replace(source, destination, **kwargs)
+
+
+def _write_all(fd: int, content: bytes) -> None:
+    view = memoryview(content)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("short file write")
+        view = view[written:]
+
+
 def _atomic_write_at(
     parent_fd: int,
     name: str,
     content: bytes,
     mode: int,
-    mutation_recorder: Callable[[tuple[int, int]], None] | None = None,
+    mutation_recorder: Callable[[tuple[int, int], bool], None] | None = None,
 ) -> tuple[int, int]:
     temporary_name = f".{name}.{os.getpid()}.{os.urandom(8).hex()}"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -563,13 +593,15 @@ def _atomic_write_at(
         temporary_info = os.fstat(fd)
         intended_identity = temporary_info.st_dev, temporary_info.st_ino
         if mutation_recorder is not None:
-            mutation_recorder(intended_identity)
-        os.replace(
+            mutation_recorder(intended_identity, False)
+        _replace_file(
             temporary_name,
             name,
             src_dir_fd=parent_fd,
             dst_dir_fd=parent_fd,
         )
+        if mutation_recorder is not None:
+            mutation_recorder(intended_identity, True)
         info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         _verify_mutation_identity(intended_identity, (info.st_dev, info.st_ino))
         return intended_identity
@@ -585,7 +617,7 @@ def _atomic_write_opened(
     content: bytes,
     *,
     rollout: bool = False,
-    mutation_recorder: Callable[[tuple[int, int]], None] | None = None,
+    mutation_recorder: Callable[[tuple[int, int], bool], None] | None = None,
 ) -> tuple[int, int]:
     if opened.parent_fd >= 0:
         return _atomic_write_at(
@@ -599,12 +631,25 @@ def _atomic_write_opened(
     current = opened.path.lstat()
     if (current.st_dev, current.st_ino) != (opened.device, opened.inode):
         raise ConcurrentChangeError(f"file identity changed before update: {opened.path}")
-    if os.name == "nt":
-        opened.close()
-        _validate_fallback_parent(home, opened.path, rollout=rollout)
-        current = opened.path.lstat()
-        if (current.st_dev, current.st_ino) != (opened.device, opened.inode):
-            raise ConcurrentChangeError(f"file identity changed before update: {opened.path}")
+    if _uses_windows_handle_delete():
+        intended_identity = opened.device, opened.inode
+        if mutation_recorder is not None:
+            mutation_recorder(intended_identity, False)
+            mutation_recorder(intended_identity, True)
+        try:
+            _write_windows_file(opened.file_fd, content)
+        except BaseException:
+            try:
+                _write_windows_file(opened.file_fd, opened.content)
+            except BaseException:
+                pass
+            else:
+                if mutation_recorder is not None:
+                    mutation_recorder(intended_identity, False)
+            raise
+        updated = os.fstat(opened.file_fd)
+        _verify_mutation_identity(intended_identity, (updated.st_dev, updated.st_ino))
+        return intended_identity
     fd, temporary_name = tempfile.mkstemp(prefix=f".{opened.path.name}.", dir=opened.path.parent)
     temporary = Path(temporary_name)
     try:
@@ -616,10 +661,12 @@ def _atomic_write_opened(
         temporary_info = os.fstat(fd)
         intended_identity = temporary_info.st_dev, temporary_info.st_ino
         if mutation_recorder is not None:
-            mutation_recorder(intended_identity)
+            mutation_recorder(intended_identity, False)
         os.close(fd)
         fd = -1
-        os.replace(temporary, opened.path)
+        _replace_file(temporary, opened.path)
+        if mutation_recorder is not None:
+            mutation_recorder(intended_identity, True)
     finally:
         if fd >= 0:
             os.close(fd)
@@ -688,6 +735,23 @@ def _restore_deleted_file_exclusive(home: Path, item: FileDeletion) -> None:
         return
 
     _validate_fallback_parent(home, item.path, rollout=True)
+    if _uses_windows_handle_delete():
+        parent_info = item.path.parent.stat()
+        parent_identity = parent_info.st_dev, parent_info.st_ino
+        fd = _create_windows_file_exclusive(item.path.parent, item.path.name, parent_identity)
+        try:
+            try:
+                _write_all(fd, item.original)
+                os.fsync(fd)
+                if hasattr(os, "fchmod"):
+                    os.fchmod(fd, item.original_mode)
+            except BaseException:
+                _delete_windows_file(fd)
+                raise
+        finally:
+            os.close(fd)
+        return
+
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     fd = os.open(item.path, flags, item.original_mode)
     created_identity: tuple[int, int] | None = None
@@ -946,13 +1010,13 @@ def apply_plan(
 
 
 def _restore_deletion_files(
-    plan: DeletionPlan, mutated_identities: dict[Path, tuple[int, int]]
+    plan: DeletionPlan, mutation_journal: dict[Path, _MutationState]
 ) -> list[str]:
     errors: list[str] = []
     for item in plan.file_updates:
         try:
-            expected_identity = mutated_identities.get(item.path)
-            if expected_identity is None:
+            mutation = mutation_journal.get(item.path)
+            if mutation is None or not mutation.applied:
                 unchanged = _open_planned_file(plan.home, item.path, item.original)
                 unchanged.close()
                 continue
@@ -960,7 +1024,7 @@ def _restore_deletion_files(
                 plan.home,
                 item.path,
                 item.updated,
-                expected_identity=expected_identity,
+                expected_identity=mutation.identity,
             )
             try:
                 _atomic_write_opened(plan.home, opened, item.original)
@@ -997,7 +1061,7 @@ def apply_deletion(
     backup_dir, _manifest = _create_deletion_backup(plan)
     databases: dict[Path, sqlite3.Connection] = {}
     committed: list[Path] = []
-    mutated_identities: dict[Path, tuple[int, int]] = {}
+    mutation_journal: dict[Path, _MutationState] = {}
     try:
         databases = _open_deletion_transactions(plan)
         _validate_locked_database_set(plan, databases)
@@ -1014,14 +1078,15 @@ def apply_deletion(
                 expected_identity=file_identities[item.path],
             )
             try:
-                mutated_identities[item.path] = _atomic_write_opened(
+                identity = _atomic_write_opened(
                     plan.home,
                     opened,
                     item.updated,
-                    mutation_recorder=lambda identity, path=item.path: (
-                        mutated_identities.__setitem__(path, identity)
+                    mutation_recorder=lambda identity, applied, path=item.path: (
+                        mutation_journal.__setitem__(path, _MutationState(identity, applied))
                     ),
                 )
+                mutation_journal[item.path] = _MutationState(identity, True)
             finally:
                 opened.close()
         for item in plan.file_deletions:
@@ -1049,7 +1114,12 @@ def apply_deletion(
                 _remove_opened_file(plan.home, opened)
             finally:
                 opened.close()
-        _verify_deletion(plan, databases, mutated_identities)
+        applied_identities = {
+            path: mutation.identity
+            for path, mutation in mutation_journal.items()
+            if mutation.applied
+        }
+        _verify_deletion(plan, databases, applied_identities)
         for path, db in databases.items():
             _commit_deletion_database(db, path)
             committed.append(path)
@@ -1063,7 +1133,7 @@ def apply_deletion(
             if path not in committed:
                 with suppress(sqlite3.Error):
                     db.rollback()
-        restore_errors = _restore_deletion_files(plan, mutated_identities)
+        restore_errors = _restore_deletion_files(plan, mutation_journal)
         grouped = _group_deletion_actions(plan.database_actions)
         for path in reversed(committed):
             restore_error = _restore_committed_actions(path, grouped.get(path, []))

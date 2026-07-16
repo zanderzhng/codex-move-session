@@ -329,6 +329,74 @@ def test_windows_native_delete_branch(tmp_path: Path) -> None:
     assert thread_count(fixture.state, "thread-1") == 0
 
 
+def test_windows_update_writes_through_validated_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    plan = build_deletion_plan(fixture.home, "thread-1")
+    update = plan.file_updates[0]
+    original_path = fixture.home / "original-global-state.json"
+    competitor = b"competitor\n"
+    native_write_calls = 0
+
+    def native_open(path: Path) -> int:
+        return os.open(path, os.O_RDWR)
+
+    def native_write(fd: int, content: bytes) -> None:
+        nonlocal native_write_calls
+        native_write_calls += 1
+        fixture.global_state.rename(original_path)
+        fixture.global_state.write_bytes(competitor)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, content)
+        os.ftruncate(fd, len(content))
+        os.fsync(fd)
+
+    monkeypatch.setattr(storage, "_supports_secure_dir_fd", lambda: False)
+    monkeypatch.setattr(storage, "_uses_windows_handle_delete", lambda: True)
+    monkeypatch.setattr(storage, "_open_windows_update_fd", native_open, raising=False)
+    monkeypatch.setattr(storage, "_write_windows_file", native_write, raising=False)
+
+    opened = storage._open_planned_file(plan.home, update.path, update.original)
+    try:
+        storage._atomic_write_opened(plan.home, opened, update.updated)
+    finally:
+        opened.close()
+
+    assert native_write_calls == 1
+    assert fixture.global_state.read_bytes() == competitor
+    assert original_path.read_bytes() == update.updated
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Win32 file handles")
+def test_windows_native_update_branch(tmp_path: Path) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    plan = build_deletion_plan(fixture.home, "thread-1")
+
+    apply_deletion(plan, process_checker=lambda: [])
+
+    updated = json.loads(fixture.global_state.read_bytes())
+    assert "thread-1" not in updated["thread-workspace-root-hints"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Win32 file handles")
+def test_windows_native_restore_branch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    original_rollout = fixture.rollout.read_bytes()
+    plan = build_deletion_plan(fixture.home, "thread-1")
+
+    def fail_verification(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("simulated verification failure")
+
+    monkeypatch.setattr(storage, "_verify_deletion", fail_verification)
+
+    with pytest.raises(ApplyError, match="touched data restored"):
+        apply_deletion(plan, process_checker=lambda: [])
+
+    assert fixture.rollout.read_bytes() == original_rollout
+    assert_delete_fixture_restored(fixture)
+
+
 def test_apply_deletion_refuses_rollout_shared_after_preview(tmp_path: Path) -> None:
     fixture = create_delete_fixture(tmp_path)
     plan = build_deletion_plan(fixture.home, "thread-1")
@@ -556,6 +624,30 @@ def test_apply_deletion_rolls_back_when_post_replace_identity_check_fails(
     assert fixture.rollout.exists()
 
 
+def test_apply_deletion_clears_prepared_journal_when_replace_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    original_global_state = fixture.global_state.read_bytes()
+    plan = build_deletion_plan(fixture.home, "thread-1")
+    replace_calls = 0
+
+    def fail_first_replace(*_args: object, **_kwargs: object) -> None:
+        nonlocal replace_calls
+        replace_calls += 1
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(storage, "_replace_file", fail_first_replace, raising=False)
+
+    with pytest.raises(ApplyError, match="touched data restored"):
+        apply_deletion(plan, process_checker=lambda: [])
+
+    assert replace_calls == 1
+    assert fixture.global_state.read_bytes() == original_global_state
+    assert_delete_fixture_restored(fixture)
+    assert fixture.rollout.exists()
+
+
 def test_apply_deletion_checks_exact_rows_inside_transaction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -633,6 +725,76 @@ def test_apply_deletion_does_not_overwrite_reused_rollout_during_rollback(
 
     assert fixture.rollout.read_bytes() == competitor
     assert_delete_fixture_restored(fixture)
+
+
+def test_windows_restore_creates_relative_to_validated_parent_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    plan = build_deletion_plan(fixture.home, "thread-1")
+    deletion = plan.file_deletions[0]
+    deletion.path.unlink()
+    original_parent = deletion.path.parent
+    expected_parent = (original_parent.stat().st_dev, original_parent.stat().st_ino)
+    external_sessions = tmp_path / "external-sessions"
+    external_parent = external_sessions / "2026" / "07"
+    external_parent.mkdir(parents=True)
+    native_create_calls = 0
+
+    def native_create(parent: Path, name: str, identity: tuple[int, int]) -> int:
+        nonlocal native_create_calls
+        native_create_calls += 1
+        assert parent == original_parent
+        assert identity == expected_parent
+        fixture.home.joinpath("sessions").rename(fixture.home / "original-sessions")
+        fixture.home.joinpath("sessions").symlink_to(external_sessions, target_is_directory=True)
+        stable_parent = fixture.home / "original-sessions" / "2026" / "07"
+        return os.open(stable_parent / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+
+    monkeypatch.setattr(storage, "_supports_secure_dir_fd", lambda: False)
+    monkeypatch.setattr(storage, "_uses_windows_handle_delete", lambda: True)
+    monkeypatch.setattr(storage, "_create_windows_file_exclusive", native_create, raising=False)
+
+    storage._restore_deleted_file_exclusive(plan.home, deletion)
+
+    assert native_create_calls == 1
+    assert not external_parent.joinpath(deletion.path.name).exists()
+    restored = fixture.home / "original-sessions" / "2026" / "07" / deletion.path.name
+    assert restored.read_bytes() == deletion.original
+
+
+def test_windows_restore_write_failure_removes_owned_partial_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    plan = build_deletion_plan(fixture.home, "thread-1")
+    deletion = plan.file_deletions[0]
+    deletion.path.unlink()
+    delete_calls = 0
+
+    def native_create(parent: Path, name: str, _identity: tuple[int, int]) -> int:
+        return os.open(parent / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+
+    def fail_write(fd: int, _content: bytes) -> None:
+        os.write(fd, b"partial")
+        raise OSError("simulated write failure")
+
+    def native_delete(fd: int) -> None:
+        nonlocal delete_calls
+        delete_calls += 1
+        deletion.path.unlink()
+
+    monkeypatch.setattr(storage, "_supports_secure_dir_fd", lambda: False)
+    monkeypatch.setattr(storage, "_uses_windows_handle_delete", lambda: True)
+    monkeypatch.setattr(storage, "_create_windows_file_exclusive", native_create, raising=False)
+    monkeypatch.setattr(storage, "_write_all", fail_write, raising=False)
+    monkeypatch.setattr(storage, "_delete_windows_file", native_delete)
+
+    with pytest.raises(OSError, match="simulated write failure"):
+        storage._restore_deleted_file_exclusive(plan.home, deletion)
+
+    assert delete_calls == 1
+    assert not deletion.path.exists()
 
 
 def test_apply_deletion_rolls_back_when_database_apply_fails(
