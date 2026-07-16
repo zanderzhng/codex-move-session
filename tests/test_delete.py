@@ -161,13 +161,22 @@ def test_windows_writable_identity_access_includes_read_attributes() -> None:
     )
 
 
-def test_windows_rename_buffer_includes_aligned_header() -> None:
+@pytest.mark.parametrize(
+    ("pointer_size", "expected_header_size", "expected_name_offset"),
+    [(4, 16, 12), (8, 24, 20)],
+)
+def test_windows_rename_buffer_includes_native_layout(
+    pointer_size: int, expected_header_size: int, expected_name_offset: int
+) -> None:
     encoded_name = "target.json".encode("utf-16-le")
+    header_size, name_offset = windows_file._rename_information_layout(pointer_size)
 
-    buffer = windows_file._build_rename_buffer(24, 20, encoded_name)
+    buffer = windows_file._build_rename_buffer(header_size, name_offset, encoded_name)
 
-    assert len(buffer) == 24 + len(encoded_name)
-    assert buffer[20 : 20 + len(encoded_name)] == encoded_name
+    assert header_size == expected_header_size
+    assert name_offset == expected_name_offset
+    assert len(buffer) == expected_header_size + len(encoded_name)
+    assert buffer[name_offset : name_offset + len(encoded_name)] == encoded_name
 
 
 def test_apply_deletion_removes_rows_and_file_and_keeps_backup(tmp_path: Path) -> None:

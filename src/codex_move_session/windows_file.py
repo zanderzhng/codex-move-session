@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import os
 from pathlib import Path
 
@@ -8,6 +9,35 @@ _DELETE = 0x00010000
 _SYNCHRONIZE = 0x00100000
 _FILE_READ_ATTRIBUTES = 0x00000080
 _WRITABLE_IDENTITY_ACCESS = _GENERIC_WRITE | _DELETE | _SYNCHRONIZE | _FILE_READ_ATTRIBUTES
+
+
+class _FileRenameInformation32(ctypes.Structure):
+    _fields_ = [
+        ("replace_if_exists", ctypes.c_int32),
+        ("root_directory", ctypes.c_uint32),
+        ("file_name_length", ctypes.c_uint32),
+        ("file_name", ctypes.c_uint16 * 1),
+    ]
+
+
+class _FileRenameInformation64(ctypes.Structure):
+    _fields_ = [
+        ("replace_if_exists", ctypes.c_int32),
+        ("root_directory", ctypes.c_uint64),
+        ("file_name_length", ctypes.c_uint32),
+        ("file_name", ctypes.c_uint16 * 1),
+    ]
+
+
+_FILE_RENAME_INFORMATION_TYPES = {
+    4: _FileRenameInformation32,
+    8: _FileRenameInformation64,
+}
+
+
+def _rename_information_layout(pointer_size: int) -> tuple[int, int]:
+    information_type = _FILE_RENAME_INFORMATION_TYPES[pointer_size]
+    return ctypes.sizeof(information_type), information_type.file_name.offset
 
 
 def _build_rename_buffer(header_size: int, name_offset: int, encoded_name: bytes) -> bytearray:
@@ -21,7 +51,6 @@ def _unsupported() -> OSError:
 
 
 if os.name == "nt":
-    import ctypes
     import msvcrt
     from ctypes import wintypes
 
@@ -85,12 +114,7 @@ if os.name == "nt":
     class _FileDispositionInfo(ctypes.Structure):
         _fields_ = [("delete_file", wintypes.BOOL)]
 
-    class _FileRenameInfoHeader(ctypes.Structure):
-        _fields_ = [
-            ("replace_if_exists", wintypes.BOOL),
-            ("root_directory", wintypes.HANDLE),
-            ("file_name_length", wintypes.DWORD),
-        ]
+    _FileRenameInfoHeader = _FILE_RENAME_INFORMATION_TYPES[ctypes.sizeof(ctypes.c_void_p)]
 
     _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     _create_file = _kernel32.CreateFileW
@@ -312,10 +336,8 @@ def _relative_file_identity(parent_handle: int, name: str) -> tuple[int, int]:
 
 def _rename_handle(handle: int, parent_handle: int, name: str) -> None:
     encoded_name = name.encode("utf-16-le")
-    name_offset = _FileRenameInfoHeader.file_name_length.offset + ctypes.sizeof(wintypes.DWORD)
-    raw_buffer = _build_rename_buffer(
-        ctypes.sizeof(_FileRenameInfoHeader), name_offset, encoded_name
-    )
+    header_size, name_offset = _rename_information_layout(ctypes.sizeof(ctypes.c_void_p))
+    raw_buffer = _build_rename_buffer(header_size, name_offset, encoded_name)
     buffer = ctypes.create_string_buffer(bytes(raw_buffer), len(raw_buffer))
     information = _FileRenameInfoHeader.from_buffer(buffer)
     information.replace_if_exists = True
