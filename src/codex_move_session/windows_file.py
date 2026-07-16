@@ -13,7 +13,7 @@ _WRITABLE_IDENTITY_ACCESS = _GENERIC_WRITE | _DELETE | _SYNCHRONIZE | _FILE_READ
 
 class _FileRenameInformation32(ctypes.Structure):
     _fields_ = [
-        ("replace_if_exists", ctypes.c_ubyte),
+        ("flags", ctypes.c_uint32),
         ("root_directory", ctypes.c_uint32),
         ("file_name_length", ctypes.c_uint32),
         ("file_name", ctypes.c_uint16 * 1),
@@ -22,7 +22,7 @@ class _FileRenameInformation32(ctypes.Structure):
 
 class _FileRenameInformation64(ctypes.Structure):
     _fields_ = [
-        ("replace_if_exists", ctypes.c_ubyte),
+        ("flags", ctypes.c_uint32),
         ("root_directory", ctypes.c_uint64),
         ("file_name_length", ctypes.c_uint32),
         ("file_name", ctypes.c_uint16 * 1),
@@ -33,7 +33,9 @@ _FILE_RENAME_INFORMATION_TYPES = {
     4: _FileRenameInformation32,
     8: _FileRenameInformation64,
 }
-_FILE_RENAME_INFORMATION_CLASS = 10
+_FILE_RENAME_REPLACE_IF_EXISTS = 0x1
+_FILE_RENAME_POSIX_SEMANTICS = 0x2
+_FILE_RENAME_INFORMATION_CLASS = 65
 
 
 def _rename_information_layout(pointer_size: int) -> tuple[int, int]:
@@ -369,7 +371,7 @@ def _rename_handle(handle: int, parent_handle: int, name: str) -> None:
     raw_buffer = _build_rename_buffer(header_size, name_offset, encoded_name)
     buffer = ctypes.create_string_buffer(bytes(raw_buffer), len(raw_buffer))
     information = _FileRenameInfoHeader.from_buffer(buffer)
-    information.replace_if_exists = True
+    information.flags = _FILE_RENAME_REPLACE_IF_EXISTS | _FILE_RENAME_POSIX_SEMANTICS
     information.root_directory = parent_handle
     information.file_name_length = len(encoded_name)
     io_status = _IoStatusBlock()

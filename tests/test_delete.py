@@ -1,3 +1,4 @@
+import ctypes
 import hashlib
 import json
 import os
@@ -179,8 +180,10 @@ def test_windows_rename_buffer_includes_native_layout(
     assert buffer[name_offset : name_offset + len(encoded_name)] == encoded_name
 
 
-def test_windows_rename_dispatch_uses_native_class_and_converts_failure() -> None:
-    calls: list[tuple[object, object, object, int, int]] = []
+def test_windows_rename_dispatch_uses_native_class_flags_and_converts_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, object, bytes, int, int]] = []
 
     def nt_set_information(
         handle: object,
@@ -189,21 +192,48 @@ def test_windows_rename_dispatch_uses_native_class_and_converts_failure() -> Non
         length: int,
         information_class: int,
     ) -> int:
-        calls.append((handle, io_status, information, length, information_class))
+        calls.append((handle, io_status, bytes(information[:length]), length, information_class))
         return -1073741811
 
-    with pytest.raises(OSError, match="converted 5"):
-        windows_file._dispatch_rename_information(
-            "handle",
-            "io-status",
-            "buffer",
-            24,
-            nt_set_information,
-            lambda status: 5 if status == -1073741811 else 0,
-            lambda code: OSError(f"converted {code}"),
-        )
+    class FakeWinTypes:
+        @staticmethod
+        def HANDLE(value: object) -> object:
+            return value
 
-    assert calls == [("handle", "io-status", "buffer", 24, 10)]
+    monkeypatch.setattr(windows_file, "wintypes", FakeWinTypes, raising=False)
+    monkeypatch.setattr(windows_file, "_IoStatusBlock", ctypes.c_byte, raising=False)
+    monkeypatch.setattr(windows_file, "_nt_set_information_file", nt_set_information, raising=False)
+    monkeypatch.setattr(
+        windows_file,
+        "_rtl_nt_status_to_dos_error",
+        lambda status: 5 if status == -1073741811 else 0,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        windows_file.ctypes,
+        "WinError",
+        lambda code: OSError(f"converted {code}"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        windows_file,
+        "_FileRenameInfoHeader",
+        windows_file._FILE_RENAME_INFORMATION_TYPES[ctypes.sizeof(ctypes.c_void_p)],
+        raising=False,
+    )
+
+    with pytest.raises(OSError, match="converted 5"):
+        windows_file._rename_handle(11, 22, "target.json")
+
+    assert len(calls) == 1
+    handle, _io_status, encoded_information, length, information_class = calls[0]
+    information = windows_file._FileRenameInfoHeader.from_buffer_copy(encoded_information)
+    assert handle == 11
+    assert length == len(encoded_information)
+    assert information_class == 65
+    assert information.flags == 3
+    assert information.root_directory == 22
+    assert information.file_name_length == len("target.json".encode("utf-16-le"))
 
 
 def test_apply_deletion_removes_rows_and_file_and_keeps_backup(tmp_path: Path) -> None:
