@@ -8,6 +8,7 @@ from test_apply import read_thread_cwd
 from test_delete import thread_count
 from test_planner import create_codex_fixture, insert_sibling_session
 
+import codex_move_session.cli as cli
 from codex_move_session.cli import PromptAdapter, run
 
 
@@ -22,9 +23,9 @@ class FakePrompts(PromptAdapter):
         old: str | Path,
         new: str | Path,
         *,
-        confirm: bool,
-        session_id: str = "thread-1",
-        action: str = "move",
+        confirm: bool = False,
+        session_id: str | None = "thread-1",
+        action: str | None = "move",
     ) -> None:
         self.old = str(old)
         self.new = str(new)
@@ -60,6 +61,8 @@ class TwoSessionCliFixture:
     old: Path
     new: Path
     state: Path
+    rollout: Path
+    global_state: Path
 
 
 def create_two_session_cli_fixture(tmp_path: Path) -> TwoSessionCliFixture:
@@ -67,9 +70,24 @@ def create_two_session_cli_fixture(tmp_path: Path) -> TwoSessionCliFixture:
     old = tmp_path / "old-project"
     new = tmp_path / "new-project"
     new.mkdir()
-    state, _ = create_codex_fixture(home, old)
+    state, rollout = create_codex_fixture(home, old)
     insert_sibling_session(home, state, old, thread_id="thread-2")
-    return TwoSessionCliFixture(home, old, new, state)
+    return TwoSessionCliFixture(
+        home,
+        old,
+        new,
+        state,
+        rollout,
+        home / ".codex-global-state.json",
+    )
+
+
+def fixture_bytes(fixture: TwoSessionCliFixture) -> tuple[bytes, bytes, bytes]:
+    return (
+        fixture.state.read_bytes(),
+        fixture.rollout.read_bytes(),
+        fixture.global_state.read_bytes(),
+    )
 
 
 def thread_cwd(path: Path, thread_id: str) -> str:
@@ -133,8 +151,10 @@ def test_noninteractive_delete_is_dry_run(tmp_path: Path) -> None:
 
     exit_code = run(["--delete", "thread-1", "--codex-home", str(home)], console=console)
 
+    output = recorder.export_text()
     assert exit_code == 0
-    assert "Delete dry run" in recorder.export_text()
+    assert "Delete dry run" in output
+    assert "thread-workspace-root-hints[thread-1]" in output
     assert read_thread_cwd(state) == str(old)
     assert rollout.exists()
 
@@ -158,6 +178,34 @@ def test_noninteractive_delete_apply_removes_session(tmp_path: Path) -> None:
 def test_parser_rejects_delete_with_move_arguments(tmp_path: Path) -> None:
     with pytest.raises(SystemExit, match="2"):
         run(["--delete", "thread-1", "--old", "/old", "--new", "/new"])
+
+
+def test_parser_rejects_empty_delete_session_id(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit, match="2"):
+        run(
+            ["--delete", "", "--codex-home", str(tmp_path / ".codex")],
+            prompts=FakePrompts("/old", "/new"),
+        )
+
+
+def test_interactive_discovery_error_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    console, recorder = recording_console()
+
+    def fail_discovery(home: Path) -> list[object]:
+        raise OSError("session database unavailable")
+
+    monkeypatch.setattr(cli, "discover_sessions", fail_discovery)
+
+    exit_code = run(
+        ["--codex-home", str(tmp_path / ".codex")],
+        console=console,
+        prompts=FakePrompts("/old", "/new"),
+    )
+
+    assert exit_code == 1
+    assert "Error: session database unavailable" in recorder.export_text()
 
 
 def test_interactive_selects_stale_path_previews_and_confirms_apply(tmp_path: Path) -> None:
@@ -220,6 +268,63 @@ def test_interactive_can_delete_one_selected_session(tmp_path: Path) -> None:
     assert exit_code == 0
     assert thread_count(fixture.state, "thread-1") == 0
     assert thread_count(fixture.state, "thread-2") == 1
+
+
+def test_interactive_delete_default_confirmation_leaves_all_data_unchanged(
+    tmp_path: Path,
+) -> None:
+    fixture = create_two_session_cli_fixture(tmp_path)
+    original = fixture_bytes(fixture)
+    console, recorder = recording_console()
+
+    exit_code = run(
+        ["--codex-home", str(fixture.home)],
+        console=console,
+        prompts=FakePrompts(fixture.old, fixture.new, action="delete"),
+        process_checker=lambda: [],
+    )
+
+    assert exit_code == 0
+    assert "Cancelled." in recorder.export_text()
+    assert fixture_bytes(fixture) == original
+
+
+def test_interactive_session_selection_cancel_leaves_all_data_unchanged(
+    tmp_path: Path,
+) -> None:
+    fixture = create_two_session_cli_fixture(tmp_path)
+    original = fixture_bytes(fixture)
+    console, recorder = recording_console()
+
+    exit_code = run(
+        ["--codex-home", str(fixture.home)],
+        console=console,
+        prompts=FakePrompts(fixture.old, fixture.new, session_id=None),
+        process_checker=lambda: [],
+    )
+
+    assert exit_code == 0
+    assert "Cancelled." in recorder.export_text()
+    assert fixture_bytes(fixture) == original
+
+
+def test_interactive_action_selection_cancel_leaves_all_data_unchanged(
+    tmp_path: Path,
+) -> None:
+    fixture = create_two_session_cli_fixture(tmp_path)
+    original = fixture_bytes(fixture)
+    console, recorder = recording_console()
+
+    exit_code = run(
+        ["--codex-home", str(fixture.home)],
+        console=console,
+        prompts=FakePrompts(fixture.old, fixture.new, action=None),
+        process_checker=lambda: [],
+    )
+
+    assert exit_code == 0
+    assert "Cancelled." in recorder.export_text()
+    assert fixture_bytes(fixture) == original
 
 
 def test_interactive_move_changes_only_selected_session(tmp_path: Path) -> None:

@@ -9,6 +9,7 @@ import questionary
 from questionary import Choice
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
 from . import __version__
 from .delete import DeletionPlan, build_deletion_plan
@@ -176,7 +177,10 @@ def render_deletion_plan(plan: DeletionPlan, console: Console, *, applying: bool
     for deletion in plan.file_deletions:
         actions.add_row("delete file", str(deletion.path), "")
     for update in plan.file_updates:
-        actions.add_row("update file", f"{update.area}: {update.path}", "")
+        location = f"{update.area}: {update.path}"
+        if update.area == "global-state-delete" and plan.session is not None:
+            location = f"remove thread-workspace-root-hints[{plan.session.id}]: {update.path}"
+        actions.add_row("update file", Text(location), "")
     console.print(actions)
     console.print(
         f"[bold]{plan.deleted_rows}[/bold] row(s) deleted, "
@@ -222,12 +226,14 @@ def run(
     args = parser.parse_args(argv)
     console = console or Console()
     prompts = prompts or PromptAdapter()
-    if args.delete and (args.old or args.new):
+    if args.delete is not None and (args.old or args.new):
         parser.error("--delete cannot be combined with --old or --new")
+    if args.delete is not None and not args.delete.strip():
+        parser.error("--delete requires a non-empty session ID")
     if bool(args.old) != bool(args.new):
         parser.error("--old and --new must be supplied together")
 
-    if args.delete:
+    if args.delete is not None:
         try:
             deletion_plan = build_deletion_plan(args.codex_home, args.delete)
         except (OSError, ValueError) as error:
@@ -255,7 +261,11 @@ def run(
             console.print("Cancelled.")
             return 0
         scope = selected_scope
-        groups = stale_groups(discover_sessions(args.codex_home), scope=scope)
+        try:
+            groups = stale_groups(discover_sessions(args.codex_home), scope=scope)
+        except (OSError, RuntimeError, ValueError) as error:
+            console.print(f"[red]Error:[/red] {error}")
+            return 1
         if not groups:
             console.print("No sessions with missing working directories were found.")
             return 0
