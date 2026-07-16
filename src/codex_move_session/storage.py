@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import stat
 import tempfile
+from collections import Counter
 from collections.abc import Callable
 from contextlib import closing, nullcontext, suppress
 from dataclasses import dataclass
@@ -63,6 +64,7 @@ class DeletionResult:
 class _OpenPlannedFile:
     parent_fd: int
     file_fd: int
+    path: Path
     name: str
     content: bytes
     mode: int
@@ -70,11 +72,25 @@ class _OpenPlannedFile:
     inode: int
 
     def close(self) -> None:
-        os.close(self.file_fd)
-        os.close(self.parent_fd)
+        if self.file_fd >= 0:
+            os.close(self.file_fd)
+            self.file_fd = -1
+        if self.parent_fd >= 0:
+            os.close(self.parent_fd)
+            self.parent_fd = -1
 
 
-def _open_safe_parent(home: Path, path: Path, *, rollout: bool) -> tuple[int, str]:
+def _supports_secure_dir_fd() -> bool:
+    supports_dir_fd = getattr(os, "supports_dir_fd", set())
+    return (
+        os.name != "nt"
+        and os.open in supports_dir_fd
+        and os.stat in supports_dir_fd
+        and os.unlink in supports_dir_fd
+    )
+
+
+def _planned_relative_parts(home: Path, path: Path, *, rollout: bool) -> tuple[str, ...]:
     try:
         relative = path.relative_to(home)
     except ValueError as error:
@@ -87,6 +103,35 @@ def _open_safe_parent(home: Path, path: Path, *, rollout: bool) -> tuple[int, st
         raise ConcurrentChangeError(f"unexpected deletion file update path: {path}")
     if any(part in {"", ".", ".."} for part in parts):
         raise ConcurrentChangeError(f"unsafe file path: {path}")
+    return parts
+
+
+def _validate_fallback_parent(home: Path, path: Path, *, rollout: bool) -> None:
+    parts = _planned_relative_parts(home, path, rollout=rollout)
+    try:
+        home_info = home.lstat()
+        if stat.S_ISLNK(home_info.st_mode) or not stat.S_ISDIR(home_info.st_mode):
+            raise ConcurrentChangeError(f"CODEX_HOME is not a real directory: {home}")
+        resolved_home = home.resolve(strict=True)
+        current = home
+        for part in parts[:-1]:
+            current /= part
+            info = current.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise ConcurrentChangeError(f"file has unsafe ancestry: {path}")
+        resolved_parent = path.parent.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        if isinstance(error, ConcurrentChangeError):
+            raise
+        raise ConcurrentChangeError(f"file path changed after preview: {path}: {error}") from error
+    try:
+        resolved_parent.relative_to(resolved_home)
+    except ValueError as error:
+        raise ConcurrentChangeError(f"file moved outside CODEX_HOME: {path}") from error
+
+
+def _open_safe_parent(home: Path, path: Path, *, rollout: bool) -> tuple[int, str]:
+    parts = _planned_relative_parts(home, path, rollout=rollout)
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     current_fd = -1
     try:
@@ -236,9 +281,17 @@ def _open_planned_file(
     current_fd = -1
     file_fd = -1
     try:
-        current_fd, name = _open_safe_parent(home, path, rollout=deletion is not None)
-        file_fd = os.open(name, file_flags, dir_fd=current_fd)
-        path_info = os.stat(name, dir_fd=current_fd, follow_symlinks=False)
+        if _supports_secure_dir_fd():
+            current_fd, name = _open_safe_parent(home, path, rollout=deletion is not None)
+            file_fd = os.open(name, file_flags, dir_fd=current_fd)
+            path_info = os.stat(name, dir_fd=current_fd, follow_symlinks=False)
+        else:
+            _validate_fallback_parent(home, path, rollout=deletion is not None)
+            name = path.name
+            file_fd = os.open(path, file_flags)
+            path_info = path.lstat()
+            if stat.S_ISLNK(path_info.st_mode):
+                raise ConcurrentChangeError(f"file is a symlink: {path}")
         file_info = os.fstat(file_fd)
         if not stat.S_ISREG(file_info.st_mode):
             raise ConcurrentChangeError(f"file is no longer regular: {path}")
@@ -265,6 +318,7 @@ def _open_planned_file(
         return _OpenPlannedFile(
             current_fd,
             file_fd,
+            path,
             name,
             content,
             file_info.st_mode,
@@ -471,7 +525,7 @@ def _remove_file(path: Path, *, dir_fd: int | None = None) -> None:
     os.unlink(path, dir_fd=dir_fd)
 
 
-def _atomic_write_at(parent_fd: int, name: str, content: bytes, mode: int) -> None:
+def _atomic_write_at(parent_fd: int, name: str, content: bytes, mode: int) -> tuple[int, int]:
     temporary_name = f".{name}.{os.getpid()}.{os.urandom(8).hex()}"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     fd = os.open(temporary_name, flags, stat.S_IMODE(mode), dir_fd=parent_fd)
@@ -486,10 +540,52 @@ def _atomic_write_at(parent_fd: int, name: str, content: bytes, mode: int) -> No
             src_dir_fd=parent_fd,
             dst_dir_fd=parent_fd,
         )
+        info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        return info.st_dev, info.st_ino
     finally:
         os.close(fd)
         with suppress(FileNotFoundError):
             os.unlink(temporary_name, dir_fd=parent_fd)
+
+
+def _atomic_write_opened(
+    home: Path, opened: _OpenPlannedFile, content: bytes, *, rollout: bool = False
+) -> tuple[int, int]:
+    if opened.parent_fd >= 0:
+        return _atomic_write_at(opened.parent_fd, opened.name, content, opened.mode)
+    _validate_fallback_parent(home, opened.path, rollout=rollout)
+    current = opened.path.lstat()
+    if (current.st_dev, current.st_ino) != (opened.device, opened.inode):
+        raise ConcurrentChangeError(f"file identity changed before update: {opened.path}")
+    if os.name == "nt":
+        opened.close()
+        _validate_fallback_parent(home, opened.path, rollout=rollout)
+        current = opened.path.lstat()
+        if (current.st_dev, current.st_ino) != (opened.device, opened.inode):
+            raise ConcurrentChangeError(f"file identity changed before update: {opened.path}")
+    _atomic_write(opened.path, content)
+    _validate_fallback_parent(home, opened.path, rollout=rollout)
+    updated = opened.path.lstat()
+    if stat.S_ISLNK(updated.st_mode) or not stat.S_ISREG(updated.st_mode):
+        raise ConcurrentChangeError(f"updated file is no longer regular: {opened.path}")
+    return updated.st_dev, updated.st_ino
+
+
+def _remove_opened_file(home: Path, opened: _OpenPlannedFile) -> None:
+    if opened.parent_fd >= 0:
+        _remove_file(Path(opened.name), dir_fd=opened.parent_fd)
+        return
+    _validate_fallback_parent(home, opened.path, rollout=True)
+    current = opened.path.lstat()
+    if (current.st_dev, current.st_ino) != (opened.device, opened.inode):
+        raise ConcurrentChangeError(f"file identity changed before delete: {opened.path}")
+    if os.name == "nt":
+        opened.close()
+        _validate_fallback_parent(home, opened.path, rollout=True)
+        current = opened.path.lstat()
+        if (current.st_dev, current.st_ino) != (opened.device, opened.inode):
+            raise ConcurrentChangeError(f"file identity changed before delete: {opened.path}")
+    _remove_file(opened.path)
 
 
 def _open_deletion_transactions(
@@ -553,7 +649,7 @@ def _restore_committed_actions(path: Path, actions: list[DatabaseAction]) -> str
                             )
                     else:
                         assigned_index = action.columns.index("assigned_thread_id")
-                        for row in action.original_rows:
+                        for row, expected_count in Counter(action.original_rows).items():
                             post_row = list(row)
                             post_row[assigned_index] = None
                             predicate = " AND ".join(f"{column} IS ?" for column in columns)
@@ -561,7 +657,7 @@ def _restore_committed_actions(path: Path, actions: list[DatabaseAction]) -> str
                                 f"UPDATE {table} SET assigned_thread_id = ? WHERE {predicate}",
                                 (row[assigned_index], *post_row),
                             )
-                            if cursor.rowcount != 1:
+                            if cursor.rowcount != expected_count:
                                 raise ConcurrentChangeError(
                                     f"cleared row changed concurrently: {path}:{action.table}"
                                 )
@@ -636,6 +732,7 @@ def _verify_applied(plan: MigrationPlan) -> None:
 def _verify_deletion(
     plan: DeletionPlan,
     databases: dict[Path, sqlite3.Connection] | None = None,
+    mutated_identities: dict[Path, tuple[int, int]] | None = None,
 ) -> None:
     for path, actions in _group_deletion_actions(plan.database_actions).items():
         if databases is None:
@@ -652,11 +749,36 @@ def _verify_deletion(
                         f"database delete verification failed: {path}:{action.table}"
                     )
     for item in plan.file_deletions:
-        if item.path.exists():
-            raise RuntimeError(f"file delete verification failed: {item.path}")
+        if _supports_secure_dir_fd():
+            parent_fd, name = _open_safe_parent(plan.home, item.path, rollout=True)
+            try:
+                try:
+                    os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise RuntimeError(f"file delete verification failed: {item.path}")
+            finally:
+                os.close(parent_fd)
+        else:
+            _validate_fallback_parent(plan.home, item.path, rollout=True)
+            try:
+                item.path.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                raise RuntimeError(f"file delete verification failed: {item.path}")
     for item in plan.file_updates:
-        if item.path.read_bytes() != item.updated:
-            raise RuntimeError(f"file update verification failed: {item.path}")
+        expected_identity = None
+        if mutated_identities is not None:
+            expected_identity = mutated_identities.get(item.path)
+        opened = _open_planned_file(
+            plan.home,
+            item.path,
+            item.updated,
+            expected_identity=expected_identity,
+        )
+        opened.close()
 
 
 def apply_plan(
@@ -696,18 +818,25 @@ def apply_plan(
     )
 
 
-def _restore_deletion_files(plan: DeletionPlan) -> list[str]:
+def _restore_deletion_files(
+    plan: DeletionPlan, mutated_identities: dict[Path, tuple[int, int]]
+) -> list[str]:
     errors: list[str] = []
     for item in plan.file_updates:
         try:
-            try:
-                opened = _open_planned_file(plan.home, item.path, item.updated)
-            except ConcurrentChangeError:
+            expected_identity = mutated_identities.get(item.path)
+            if expected_identity is None:
                 unchanged = _open_planned_file(plan.home, item.path, item.original)
                 unchanged.close()
                 continue
+            opened = _open_planned_file(
+                plan.home,
+                item.path,
+                item.updated,
+                expected_identity=expected_identity,
+            )
             try:
-                _atomic_write_at(opened.parent_fd, opened.name, item.original, opened.mode)
+                _atomic_write_opened(plan.home, opened, item.original)
             finally:
                 opened.close()
         except (ConcurrentChangeError, OSError) as error:
@@ -717,16 +846,28 @@ def _restore_deletion_files(plan: DeletionPlan) -> list[str]:
             try:
                 unchanged = _open_planned_file(plan.home, item.path, item.original, deletion=item)
             except ConcurrentChangeError:
-                parent_fd, name = _open_safe_parent(plan.home, item.path, rollout=True)
-                try:
+                if _supports_secure_dir_fd():
+                    parent_fd, name = _open_safe_parent(plan.home, item.path, rollout=True)
                     try:
-                        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                        try:
+                            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                        except FileNotFoundError:
+                            _atomic_write_at(parent_fd, name, item.original, item.original_mode)
+                        else:
+                            raise ConcurrentChangeError(
+                                f"deleted rollout path was reused: {item.path}"
+                            )
+                    finally:
+                        os.close(parent_fd)
+                else:
+                    _validate_fallback_parent(plan.home, item.path, rollout=True)
+                    try:
+                        item.path.lstat()
                     except FileNotFoundError:
-                        _atomic_write_at(parent_fd, name, item.original, item.original_mode)
+                        _atomic_write(item.path, item.original)
+                        os.chmod(item.path, item.original_mode)
                     else:
                         raise ConcurrentChangeError(f"deleted rollout path was reused: {item.path}")
-                finally:
-                    os.close(parent_fd)
             else:
                 unchanged.close()
         except (ConcurrentChangeError, OSError) as error:
@@ -750,9 +891,13 @@ def apply_deletion(
     backup_dir, _manifest = _create_deletion_backup(plan)
     databases: dict[Path, sqlite3.Connection] = {}
     committed: list[Path] = []
+    mutated_identities: dict[Path, tuple[int, int]] = {}
     try:
         databases = _open_deletion_transactions(plan)
         _validate_locked_database_set(plan, databases)
+        running = process_checker()
+        if running:
+            raise ProcessRunningError("Close Codex before applying changes: " + ", ".join(running))
         for path, actions in _group_deletion_actions(plan.database_actions).items():
             _apply_deletion_actions(databases[path], path, actions)
         for item in plan.file_updates:
@@ -763,7 +908,9 @@ def apply_deletion(
                 expected_identity=file_identities[item.path],
             )
             try:
-                _atomic_write_at(opened.parent_fd, opened.name, item.updated, opened.mode)
+                mutated_identities[item.path] = _atomic_write_opened(
+                    plan.home, opened, item.updated
+                )
             finally:
                 opened.close()
         for item in plan.file_deletions:
@@ -775,7 +922,11 @@ def apply_deletion(
                 expected_identity=file_identities[item.path],
             )
             try:
-                current = os.stat(opened.name, dir_fd=opened.parent_fd, follow_symlinks=False)
+                if opened.parent_fd >= 0:
+                    current = os.stat(opened.name, dir_fd=opened.parent_fd, follow_symlinks=False)
+                else:
+                    _validate_fallback_parent(plan.home, item.path, rollout=True)
+                    current = item.path.lstat()
                 if (current.st_dev, current.st_ino) != (
                     item.original_device,
                     item.original_inode,
@@ -783,19 +934,25 @@ def apply_deletion(
                     raise ConcurrentChangeError(
                         f"file identity changed immediately before delete: {item.path}"
                     )
-                _remove_file(Path(opened.name), dir_fd=opened.parent_fd)
+                _validate_locked_database_set(plan, databases)
+                _remove_opened_file(plan.home, opened)
             finally:
                 opened.close()
-        _verify_deletion(plan, databases)
+        _verify_deletion(plan, databases, mutated_identities)
         for path, db in databases.items():
             _commit_deletion_database(db, path)
             committed.append(path)
+    except ProcessRunningError:
+        for db in databases.values():
+            with suppress(sqlite3.Error):
+                db.rollback()
+        raise
     except BaseException as error:
         for path, db in databases.items():
             if path not in committed:
                 with suppress(sqlite3.Error):
                     db.rollback()
-        restore_errors = _restore_deletion_files(plan)
+        restore_errors = _restore_deletion_files(plan, mutated_identities)
         grouped = _group_deletion_actions(plan.database_actions)
         for path in reversed(committed):
             restore_error = _restore_committed_actions(path, grouped.get(path, []))
