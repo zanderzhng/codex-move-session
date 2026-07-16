@@ -26,19 +26,25 @@ from .delete import (
 )
 from .planner import DatabaseChange, MigrationPlan
 from .windows_file import (
+    atomic_replace_file as _atomic_replace_windows_file,
+)
+from .windows_file import (
     create_file_exclusive_at as _create_windows_file_exclusive,
 )
 from .windows_file import (
     delete_file_by_fd as _delete_windows_file,
 )
 from .windows_file import (
+    get_file_identity as _get_windows_file_identity,
+)
+from .windows_file import (
+    get_handle_identity as _get_windows_handle_identity,
+)
+from .windows_file import (
     open_file_for_delete as _open_windows_delete_fd,
 )
 from .windows_file import (
     open_file_for_update as _open_windows_update_fd,
-)
-from .windows_file import (
-    write_file_by_fd as _write_windows_file,
 )
 
 
@@ -334,14 +340,10 @@ def _open_planned_file(
             raise ConcurrentChangeError(f"file is no longer regular: {path}")
         if (path_info.st_dev, path_info.st_ino) != (file_info.st_dev, file_info.st_ino):
             raise ConcurrentChangeError(f"file identity changed after preview: {path}")
-        if (
-            expected_identity is not None
-            and (
-                file_info.st_dev,
-                file_info.st_ino,
-            )
-            != expected_identity
-        ):
+        identity = file_info.st_dev, file_info.st_ino
+        if deletion is None and _uses_windows_handle_delete():
+            identity = _get_windows_handle_identity(file_fd)
+        if expected_identity is not None and identity != expected_identity:
             raise ConcurrentChangeError(f"file identity changed after preview: {path}")
         if deletion is not None and (
             file_info.st_dev != deletion.original_device
@@ -359,8 +361,8 @@ def _open_planned_file(
             name,
             content,
             file_info.st_mode,
-            file_info.st_dev,
-            file_info.st_ino,
+            identity[0],
+            identity[1],
         )
     except (ConcurrentChangeError, OSError) as error:
         if file_fd >= 0:
@@ -628,28 +630,20 @@ def _atomic_write_opened(
             mutation_recorder,
         )
     _validate_fallback_parent(home, opened.path, rollout=rollout)
+    if _uses_windows_handle_delete():
+        parent_identity = _get_windows_file_identity(opened.path.parent)
+        return _atomic_replace_windows_file(
+            opened.file_fd,
+            opened.path.parent,
+            opened.name,
+            parent_identity,
+            (opened.device, opened.inode),
+            content,
+            mutation_recorder,
+        )
     current = opened.path.lstat()
     if (current.st_dev, current.st_ino) != (opened.device, opened.inode):
         raise ConcurrentChangeError(f"file identity changed before update: {opened.path}")
-    if _uses_windows_handle_delete():
-        intended_identity = opened.device, opened.inode
-        if mutation_recorder is not None:
-            mutation_recorder(intended_identity, False)
-            mutation_recorder(intended_identity, True)
-        try:
-            _write_windows_file(opened.file_fd, content)
-        except BaseException:
-            try:
-                _write_windows_file(opened.file_fd, opened.content)
-            except BaseException:
-                pass
-            else:
-                if mutation_recorder is not None:
-                    mutation_recorder(intended_identity, False)
-            raise
-        updated = os.fstat(opened.file_fd)
-        _verify_mutation_identity(intended_identity, (updated.st_dev, updated.st_ino))
-        return intended_identity
     fd, temporary_name = tempfile.mkstemp(prefix=f".{opened.path.name}.", dir=opened.path.parent)
     temporary = Path(temporary_name)
     try:
@@ -736,8 +730,7 @@ def _restore_deleted_file_exclusive(home: Path, item: FileDeletion) -> None:
 
     _validate_fallback_parent(home, item.path, rollout=True)
     if _uses_windows_handle_delete():
-        parent_info = item.path.parent.stat()
-        parent_identity = parent_info.st_dev, parent_info.st_ino
+        parent_identity = _get_windows_file_identity(item.path.parent)
         fd = _create_windows_file_exclusive(item.path.parent, item.path.name, parent_identity)
         try:
             try:

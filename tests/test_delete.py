@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 import codex_move_session.storage as storage
+import codex_move_session.windows_file as windows_file
 from codex_move_session.delete import build_deletion_plan
 from codex_move_session.storage import (
     ApplyError,
@@ -329,43 +330,106 @@ def test_windows_native_delete_branch(tmp_path: Path) -> None:
     assert thread_count(fixture.state, "thread-1") == 0
 
 
-def test_windows_update_writes_through_validated_handle(
+def test_windows_update_uses_handle_relative_atomic_replace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fixture = create_delete_fixture(tmp_path)
     plan = build_deletion_plan(fixture.home, "thread-1")
     update = plan.file_updates[0]
-    original_path = fixture.home / "original-global-state.json"
-    competitor = b"competitor\n"
-    native_write_calls = 0
+    native_replace_calls = 0
 
     def native_open(path: Path) -> int:
         return os.open(path, os.O_RDWR)
 
-    def native_write(fd: int, content: bytes) -> None:
-        nonlocal native_write_calls
-        native_write_calls += 1
-        fixture.global_state.rename(original_path)
-        fixture.global_state.write_bytes(competitor)
-        os.lseek(fd, 0, os.SEEK_SET)
-        os.write(fd, content)
-        os.ftruncate(fd, len(content))
-        os.fsync(fd)
+    def native_identity(_fd: int) -> tuple[int, int]:
+        return 101, 202
+
+    def native_parent_identity(_path: Path) -> tuple[int, int]:
+        return 303, 404
+
+    def native_replace(
+        fd: int,
+        parent: Path,
+        name: str,
+        parent_identity: tuple[int, int],
+        target_identity: tuple[int, int],
+        content: bytes,
+        recorder: object,
+    ) -> tuple[int, int]:
+        nonlocal native_replace_calls
+        native_replace_calls += 1
+        assert os.fstat(fd)
+        assert parent == fixture.global_state.parent
+        assert name == fixture.global_state.name
+        assert parent_identity == (303, 404)
+        assert target_identity == (101, 202)
+        temporary = parent / ".native-update.tmp"
+        temporary.write_bytes(content)
+        intended = (temporary.stat().st_dev, temporary.stat().st_ino)
+        recorder(intended, False)
+        os.replace(temporary, fixture.global_state)
+        recorder(intended, True)
+        return intended
 
     monkeypatch.setattr(storage, "_supports_secure_dir_fd", lambda: False)
     monkeypatch.setattr(storage, "_uses_windows_handle_delete", lambda: True)
     monkeypatch.setattr(storage, "_open_windows_update_fd", native_open, raising=False)
-    monkeypatch.setattr(storage, "_write_windows_file", native_write, raising=False)
+    monkeypatch.setattr(storage, "_get_windows_handle_identity", native_identity, raising=False)
+    monkeypatch.setattr(
+        storage, "_get_windows_file_identity", native_parent_identity, raising=False
+    )
+    monkeypatch.setattr(storage, "_atomic_replace_windows_file", native_replace, raising=False)
 
     opened = storage._open_planned_file(plan.home, update.path, update.original)
     try:
-        storage._atomic_write_opened(plan.home, opened, update.updated)
+        storage._atomic_write_opened(
+            plan.home, opened, update.updated, mutation_recorder=lambda *_args: None
+        )
     finally:
         opened.close()
 
-    assert native_write_calls == 1
+    assert native_replace_calls == 1
+    assert fixture.global_state.read_bytes() == update.updated
+
+
+def test_windows_atomic_update_refuses_substituted_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    plan = build_deletion_plan(fixture.home, "thread-1")
+    update = plan.file_updates[0]
+    competitor = b"competitor\n"
+
+    monkeypatch.setattr(storage, "_supports_secure_dir_fd", lambda: False)
+    monkeypatch.setattr(storage, "_uses_windows_handle_delete", lambda: True)
+    monkeypatch.setattr(storage, "_open_windows_update_fd", lambda path: os.open(path, os.O_RDWR))
+    monkeypatch.setattr(storage, "_get_windows_handle_identity", lambda _fd: (1, 2), raising=False)
+    monkeypatch.setattr(storage, "_get_windows_file_identity", lambda _path: (3, 4), raising=False)
+
+    def refuse_substitution(
+        _fd: int,
+        _parent: Path,
+        _name: str,
+        _parent_identity: tuple[int, int],
+        _target_identity: tuple[int, int],
+        _content: bytes,
+        _recorder: object,
+    ) -> tuple[int, int]:
+        replacement = fixture.global_state.with_suffix(".replacement")
+        replacement.write_bytes(competitor)
+        replacement.replace(fixture.global_state)
+        raise ConcurrentChangeError("target identity changed before atomic replace")
+
+    monkeypatch.setattr(storage, "_atomic_replace_windows_file", refuse_substitution, raising=False)
+
+    opened = storage._open_planned_file(plan.home, update.path, update.original)
+    try:
+        with pytest.raises(ConcurrentChangeError, match="target identity changed"):
+            storage._atomic_write_opened(plan.home, opened, update.updated)
+    finally:
+        opened.close()
+
     assert fixture.global_state.read_bytes() == competitor
-    assert original_path.read_bytes() == update.updated
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Win32 file handles")
@@ -735,7 +799,7 @@ def test_windows_restore_creates_relative_to_validated_parent_handle(
     deletion = plan.file_deletions[0]
     deletion.path.unlink()
     original_parent = deletion.path.parent
-    expected_parent = (original_parent.stat().st_dev, original_parent.stat().st_ino)
+    expected_parent = (0xAABBCCDD, 0x1122334455667788)
     external_sessions = tmp_path / "external-sessions"
     external_parent = external_sessions / "2026" / "07"
     external_parent.mkdir(parents=True)
@@ -753,6 +817,9 @@ def test_windows_restore_creates_relative_to_validated_parent_handle(
 
     monkeypatch.setattr(storage, "_supports_secure_dir_fd", lambda: False)
     monkeypatch.setattr(storage, "_uses_windows_handle_delete", lambda: True)
+    monkeypatch.setattr(
+        storage, "_get_windows_file_identity", lambda _path: expected_parent, raising=False
+    )
     monkeypatch.setattr(storage, "_create_windows_file_exclusive", native_create, raising=False)
 
     storage._restore_deleted_file_exclusive(plan.home, deletion)
@@ -761,6 +828,25 @@ def test_windows_restore_creates_relative_to_validated_parent_handle(
     assert not external_parent.joinpath(deletion.path.name).exists()
     restored = fixture.home / "original-sessions" / "2026" / "07" / deletion.path.name
     assert restored.read_bytes() == deletion.original
+
+
+def test_windows_handle_adoption_deletes_child_when_crt_conversion_fails() -> None:
+    calls: list[str] = []
+
+    def fail_open(_handle: int, _flags: int) -> int:
+        calls.append("open")
+        raise OSError("simulated CRT conversion failure")
+
+    def mark_delete(_handle: int) -> None:
+        calls.append("delete")
+
+    def close(_handle: int) -> None:
+        calls.append("close")
+
+    with pytest.raises(OSError, match="CRT conversion failure"):
+        windows_file.adopt_created_handle(123, 0, fail_open, mark_delete, close)
+
+    assert calls == ["open", "delete", "close"]
 
 
 def test_windows_restore_write_failure_removes_owned_partial_file(
@@ -786,6 +872,7 @@ def test_windows_restore_write_failure_removes_owned_partial_file(
 
     monkeypatch.setattr(storage, "_supports_secure_dir_fd", lambda: False)
     monkeypatch.setattr(storage, "_uses_windows_handle_delete", lambda: True)
+    monkeypatch.setattr(storage, "_get_windows_file_identity", lambda _path: (1, 2), raising=False)
     monkeypatch.setattr(storage, "_create_windows_file_exclusive", native_create, raising=False)
     monkeypatch.setattr(storage, "_write_all", fail_write, raising=False)
     monkeypatch.setattr(storage, "_delete_windows_file", native_delete)
