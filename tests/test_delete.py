@@ -849,6 +849,40 @@ def test_windows_handle_adoption_deletes_child_when_crt_conversion_fails() -> No
     assert calls == ["open", "delete", "close"]
 
 
+def test_windows_atomic_cleanup_closes_handles_when_delete_pending_fails() -> None:
+    calls: list[str] = []
+    original_error = OSError("simulated temporary write failure")
+
+    def get_handle(fd: int) -> int:
+        calls.append(f"get:{fd}")
+        return 123
+
+    def fail_delete(handle: int) -> None:
+        calls.append(f"delete:{handle}")
+        raise OSError("simulated delete-pending failure")
+
+    def close_fd(fd: int) -> None:
+        calls.append(f"close-fd:{fd}")
+
+    def close_handle(handle: int) -> None:
+        calls.append(f"close-handle:{handle}")
+
+    with pytest.raises(OSError, match="delete-pending failure") as raised:
+        windows_file.cleanup_atomic_handles(
+            10,
+            20,
+            False,
+            original_error,
+            get_handle,
+            fail_delete,
+            close_fd,
+            close_handle,
+        )
+
+    assert raised.value.__cause__ is original_error
+    assert calls == ["get:10", "delete:123", "close-fd:10", "close-handle:20"]
+
+
 def test_windows_restore_write_failure_removes_owned_partial_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

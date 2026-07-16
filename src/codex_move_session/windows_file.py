@@ -151,6 +151,48 @@ def adopt_created_handle(
         raise
 
 
+class AtomicCleanupError(OSError):
+    def __init__(self, errors: list[BaseException]) -> None:
+        self.errors = tuple(errors)
+        details = "; ".join(str(error) for error in errors)
+        super().__init__(f"Windows atomic update cleanup failed: {details}")
+
+
+def cleanup_atomic_handles(
+    temporary_fd: int,
+    parent_handle: int,
+    renamed: bool,
+    operation_error: BaseException | None,
+    get_handle: object,
+    mark_delete: object,
+    close_fd: object,
+    close_handle: object,
+) -> None:
+    cleanup_errors: list[BaseException] = []
+    try:
+        if temporary_fd >= 0:
+            try:
+                if not renamed:
+                    mark_delete(get_handle(temporary_fd))
+            except BaseException as error:
+                cleanup_errors.append(error)
+            finally:
+                try:
+                    close_fd(temporary_fd)
+                except BaseException as error:
+                    cleanup_errors.append(error)
+    finally:
+        try:
+            close_handle(parent_handle)
+        except BaseException as error:
+            cleanup_errors.append(error)
+    if cleanup_errors:
+        cleanup_error = AtomicCleanupError(cleanup_errors)
+        if operation_error is not None:
+            raise cleanup_error from operation_error
+        raise cleanup_error from cleanup_errors[0]
+
+
 def _mark_delete_handle(handle: int) -> None:
     disposition = _FileDispositionInfo(True)
     if not _set_file_information(
@@ -386,6 +428,7 @@ def atomic_replace_file(
     temporary_name = f".{name}.{os.getpid()}.{os.urandom(8).hex()}"
     temporary_fd = -1
     renamed = False
+    operation_error: BaseException | None = None
     try:
         temporary_handle = _create_relative_handle(
             parent_handle,
@@ -427,12 +470,20 @@ def atomic_replace_file(
                 f"found {actual_identity}"
             )
         return intended_identity
+    except BaseException as error:
+        operation_error = error
+        raise
     finally:
-        if temporary_fd >= 0:
-            if not renamed:
-                _mark_delete_handle(msvcrt.get_osfhandle(temporary_fd))
-            os.close(temporary_fd)
-        _close_handle(parent_handle)
+        cleanup_atomic_handles(
+            temporary_fd,
+            parent_handle,
+            renamed,
+            operation_error,
+            msvcrt.get_osfhandle,
+            _mark_delete_handle,
+            os.close,
+            _close_handle,
+        )
 
 
 def write_file_by_fd(fd: int, content: bytes) -> None:
