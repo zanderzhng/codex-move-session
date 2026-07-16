@@ -205,16 +205,24 @@ def _restore_copy(source: Path, destination: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _restore_database(source: Path, destination: Path) -> None:
+    with (
+        closing(sqlite3.connect(source.resolve().as_uri() + "?mode=ro", uri=True)) as backup,
+        closing(sqlite3.connect(destination)) as database,
+    ):
+        backup.backup(database)
+
+
 def _restore_backup(backup_dir: Path, manifest: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     for entry in manifest["databases"]:
         destination = Path(entry["original"])
         source = backup_dir / entry["backup"]
         try:
-            _restore_copy(source, destination)
+            _restore_database(source, destination)
             Path(f"{destination}-wal").unlink(missing_ok=True)
             Path(f"{destination}-shm").unlink(missing_ok=True)
-        except OSError as error:
+        except (OSError, sqlite3.Error) as error:
             errors.append(f"{destination}: {error}")
     for entry in manifest["files"]:
         destination = Path(entry["original"])

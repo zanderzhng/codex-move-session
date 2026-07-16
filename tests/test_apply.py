@@ -33,7 +33,7 @@ def test_apply_updates_all_stores_creates_backup_and_is_idempotent(tmp_path: Pat
     assert read_thread_cwd(state) == str(new)
     rollout_items = [json.loads(line) for line in rollout.read_text().splitlines()]
     assert rollout_items[0]["payload"]["cwd"] == str(new)
-    assert str(new / "src") in rollout_items[1]["payload"]["text"]
+    assert f"{new}/src" in rollout_items[1]["payload"]["text"]
     with sqlite3.connect(home / "memories_1.sqlite") as db:
         memory = db.execute(
             "SELECT raw_memory FROM stage1_outputs WHERE thread_id='thread-1'"
@@ -94,4 +94,29 @@ def test_apply_restores_database_when_file_write_fails(
 
     assert read_thread_cwd(state) == str(old)
     assert rollout.read_bytes() == original_rollout
+    assert raised.value.backup_dir.is_dir()
+
+
+def test_apply_reports_database_restore_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / ".codex"
+    old = tmp_path / "old-project"
+    new = tmp_path / "new-project"
+    new.mkdir()
+    create_codex_fixture(home, old)
+    plan = build_plan(home, str(old), str(new))
+
+    def fail_write(path: Path, content: bytes) -> None:
+        raise OSError("simulated write failure")
+
+    def fail_restore(source: Path, destination: Path) -> None:
+        raise sqlite3.OperationalError("simulated restore failure")
+
+    monkeypatch.setattr(storage, "_atomic_write", fail_write)
+    monkeypatch.setattr(storage, "_restore_database", fail_restore)
+
+    with pytest.raises(ApplyError, match="rollback was incomplete") as raised:
+        apply_plan(plan, process_checker=lambda: [])
+
     assert raised.value.backup_dir.is_dir()
