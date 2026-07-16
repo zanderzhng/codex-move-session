@@ -40,6 +40,10 @@ codex-move-session = "codex_move_session.cli:main"
 requires = ["uv_build>=0.9.0,<0.12.0"]
 build-backend = "uv_build"
 
+[tool.uv.build-backend]
+source-exclude = ["**/*SFConflict*"]
+wheel-exclude = ["**/*SFConflict*"]
+
 [dependency-groups]
 dev = [
     "pytest>=8.3",
@@ -47,6 +51,7 @@ dev = [
 ]
 
 [tool.ruff]
+extend-exclude = ["*SFConflict*"]
 line-length = 100
 target-version = "py310"
 
