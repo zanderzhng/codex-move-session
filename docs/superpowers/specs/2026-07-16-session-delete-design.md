@@ -125,13 +125,13 @@ eligible for deletion only when:
 
 - Its resolved path is within `CODEX_HOME/sessions` or `CODEX_HOME/archived_sessions`.
 - No non-selected thread record references the same resolved path.
-- The file is a regular file and can be read for backup.
+- The path is absolute, is a regular file, is not a symlink, and can be read for backup.
 
 A missing rollout file produces a warning because the database session can still be removed. A path
 outside the allowed roots, a shared rollout path, or an unreadable existing file is a plan error and
 blocks apply.
 
-The tool never follows a rollout symlink outside the allowed roots.
+The tool rejects rollout symlinks instead of following them.
 
 ## Dry-Run Rendering
 
