@@ -15,6 +15,7 @@ from typing import Any
 
 import psutil
 
+from .delete import DatabaseAction, DeletionPlan
 from .planner import DatabaseChange, MigrationPlan
 
 
@@ -41,6 +42,14 @@ class ApplyResult:
     backup_dir: Path | None
     database_changes: int
     file_changes: int
+
+
+@dataclass(frozen=True)
+class DeletionResult:
+    backup_dir: Path
+    deleted_rows: int
+    cleared_assignments: int
+    deleted_files: int
 
 
 def running_codex_processes() -> list[str]:
@@ -87,6 +96,15 @@ def _group_database_changes(
     return grouped
 
 
+def _group_deletion_actions(
+    actions: tuple[DatabaseAction, ...],
+) -> dict[Path, list[DatabaseAction]]:
+    grouped: dict[Path, list[DatabaseAction]] = {}
+    for action in actions:
+        grouped.setdefault(action.path, []).append(action)
+    return grouped
+
+
 def _quote_identifier(value: str) -> str:
     if not value.replace("_", "").isalnum():
         raise PlanValidationError(f"unsafe SQLite identifier: {value}")
@@ -126,6 +144,39 @@ def _validate_unchanged(plan: MigrationPlan) -> None:
             raise ConcurrentChangeError(message) from error
         if hashlib.sha256(current).hexdigest() != change.original_digest:
             raise ConcurrentChangeError(f"file changed after preview: {change.path}")
+
+
+def _read_action_rows(
+    db: sqlite3.Connection, action: DatabaseAction
+) -> tuple[tuple[Any, ...], ...]:
+    return tuple(
+        sorted(
+            db.execute(
+                f'SELECT * FROM "{action.table}" WHERE {action.where_clause}', action.params
+            ),
+            key=repr,
+        )
+    )
+
+
+def _validate_deletion_unchanged(plan: DeletionPlan) -> None:
+    for path, actions in _group_deletion_actions(plan.database_actions).items():
+        connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        with closing(connection) as db:
+            for action in actions:
+                if _read_action_rows(db, action) != action.original_rows:
+                    raise ConcurrentChangeError(
+                        f"database changed after delete preview: {path}:{action.table}"
+                    )
+    for item in plan.file_deletions:
+        if (
+            not item.path.is_file()
+            or hashlib.sha256(item.path.read_bytes()).hexdigest() != item.original_digest
+        ):
+            raise ConcurrentChangeError(f"file changed after delete preview: {item.path}")
+    for item in plan.file_updates:
+        if hashlib.sha256(item.path.read_bytes()).hexdigest() != item.original_digest:
+            raise ConcurrentChangeError(f"file changed after delete preview: {item.path}")
 
 
 def _backup_database(source_path: Path, backup_path: Path) -> None:
@@ -168,6 +219,42 @@ def _create_backup(plan: MigrationPlan) -> tuple[Path, dict[str, Any]]:
     return backup_dir, manifest
 
 
+def _create_deletion_backup(plan: DeletionPlan) -> tuple[Path, dict[str, Any]]:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    backup_dir = plan.home / "backups" / f"codex-move-session-{timestamp}"
+    database_dir = backup_dir / "databases"
+    file_dir = backup_dir / "files"
+    database_dir.mkdir(parents=True)
+    file_dir.mkdir()
+    database_paths = sorted({action.path for action in plan.database_actions})
+    file_paths = sorted(
+        {item.path for item in plan.file_deletions} | {item.path for item in plan.file_updates}
+    )
+    manifest: dict[str, Any] = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "action": "delete",
+        "session_id": plan.session.id if plan.session else "",
+        "databases": [],
+        "files": [],
+    }
+    for index, path in enumerate(database_paths):
+        backup_path = database_dir / f"{index:03d}-{path.name}"
+        _backup_database(path, backup_path)
+        manifest["databases"].append(
+            {"original": str(path), "backup": str(backup_path.relative_to(backup_dir))}
+        )
+    for index, path in enumerate(file_paths):
+        backup_path = file_dir / f"{index:03d}-{path.name}.bin"
+        backup_path.write_bytes(path.read_bytes())
+        manifest["files"].append(
+            {"original": str(path), "backup": str(backup_path.relative_to(backup_dir))}
+        )
+    (backup_dir / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    return backup_dir, manifest
+
+
 def _apply_database_changes(path: Path, changes: list[DatabaseChange]) -> None:
     with closing(sqlite3.connect(path)) as db:
         db.execute("BEGIN IMMEDIATE")
@@ -177,8 +264,7 @@ def _apply_database_changes(path: Path, changes: list[DatabaseChange]) -> None:
                 column = _quote_identifier(change.column)
                 key_column = _quote_identifier(change.key_column)
                 cursor = db.execute(
-                    f"UPDATE {table} SET {column} = ? "
-                    f"WHERE {key_column} = ? AND {column} = ?",
+                    f"UPDATE {table} SET {column} = ? WHERE {key_column} = ? AND {column} = ?",
                     (change.updated, change.key, change.original),
                 )
                 if cursor.rowcount != 1:
@@ -190,6 +276,36 @@ def _apply_database_changes(path: Path, changes: list[DatabaseChange]) -> None:
         except BaseException:
             db.rollback()
             raise
+
+
+def _apply_deletion_actions(path: Path, actions: list[DatabaseAction]) -> None:
+    with closing(sqlite3.connect(path)) as db:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            for action in actions:
+                if action.action == "clear":
+                    cursor = db.execute(
+                        f'UPDATE "{action.table}" SET assigned_thread_id = NULL '
+                        f"WHERE {action.where_clause}",
+                        action.params,
+                    )
+                else:
+                    cursor = db.execute(
+                        f'DELETE FROM "{action.table}" WHERE {action.where_clause}',
+                        action.params,
+                    )
+                if cursor.rowcount != action.row_count:
+                    raise ConcurrentChangeError(
+                        f"database changed during delete: {path}:{action.table}"
+                    )
+            db.commit()
+        except BaseException:
+            db.rollback()
+            raise
+
+
+def _remove_file(path: Path) -> None:
+    path.unlink()
 
 
 def _restore_copy(source: Path, destination: Path) -> None:
@@ -251,6 +367,25 @@ def _verify_applied(plan: MigrationPlan) -> None:
             raise RuntimeError(f"file verification failed: {change.path}")
 
 
+def _verify_deletion(plan: DeletionPlan) -> None:
+    for path, actions in _group_deletion_actions(plan.database_actions).items():
+        connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        with closing(connection) as db:
+            if db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                raise RuntimeError(f"SQLite quick_check failed: {path}")
+            for action in actions:
+                if _read_action_rows(db, action):
+                    raise RuntimeError(
+                        f"database delete verification failed: {path}:{action.table}"
+                    )
+    for item in plan.file_deletions:
+        if item.path.exists():
+            raise RuntimeError(f"file delete verification failed: {item.path}")
+    for item in plan.file_updates:
+        if item.path.read_bytes() != item.updated:
+            raise RuntimeError(f"file update verification failed: {item.path}")
+
+
 def apply_plan(
     plan: MigrationPlan,
     *,
@@ -285,4 +420,42 @@ def apply_plan(
         backup_dir=backup_dir,
         database_changes=len(plan.database_changes),
         file_changes=len(plan.file_changes),
+    )
+
+
+def apply_deletion(
+    plan: DeletionPlan,
+    *,
+    process_checker: Callable[[], list[str]] = running_codex_processes,
+) -> DeletionResult:
+    if plan.errors or plan.session is None:
+        raise PlanValidationError("deletion plan contains errors: " + "; ".join(plan.errors))
+    running = process_checker()
+    if running:
+        raise ProcessRunningError("Close Codex before applying changes: " + ", ".join(running))
+    if not plan.has_changes:
+        raise PlanValidationError("deletion plan contains no changes")
+    _validate_deletion_unchanged(plan)
+    backup_dir, manifest = _create_deletion_backup(plan)
+    try:
+        for path, actions in _group_deletion_actions(plan.database_actions).items():
+            _apply_deletion_actions(path, actions)
+        for item in plan.file_updates:
+            _atomic_write(item.path, item.updated)
+        for item in plan.file_deletions:
+            _remove_file(item.path)
+        _verify_deletion(plan)
+    except BaseException as error:
+        restore_errors = _restore_backup(backup_dir, manifest)
+        if restore_errors:
+            raise ApplyError(
+                f"delete failed and rollback was incomplete: {error}; {'; '.join(restore_errors)}",
+                backup_dir,
+            ) from error
+        raise ApplyError(f"delete failed; touched data restored: {error}", backup_dir) from error
+    return DeletionResult(
+        backup_dir=backup_dir,
+        deleted_rows=plan.deleted_rows,
+        cleared_assignments=plan.cleared_assignments,
+        deleted_files=len(plan.file_deletions),
     )

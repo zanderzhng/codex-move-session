@@ -6,7 +6,15 @@ from pathlib import Path
 
 import pytest
 
+import codex_move_session.storage as storage
 from codex_move_session.delete import build_deletion_plan
+from codex_move_session.storage import (
+    ApplyError,
+    ConcurrentChangeError,
+    DeletionResult,
+    ProcessRunningError,
+    apply_deletion,
+)
 
 
 @dataclass(frozen=True)
@@ -15,6 +23,7 @@ class DeleteFixture:
     state: Path
     rollout: Path
     global_state: Path
+    memories: Path
 
 
 def _create_thread_tables(db: sqlite3.Connection) -> None:
@@ -83,7 +92,88 @@ def create_delete_fixture(
             }
         )
     )
-    return DeleteFixture(home, state, rollout, global_state)
+    return DeleteFixture(home, state, rollout, global_state, memories)
+
+
+def thread_count(path: Path, thread_id: str) -> int:
+    with sqlite3.connect(path) as db:
+        return db.execute("SELECT COUNT(*) FROM threads WHERE id = ?", (thread_id,)).fetchone()[0]
+
+
+def related_count(path: Path, table: str, thread_id: str) -> int:
+    with sqlite3.connect(path) as db:
+        return db.execute(
+            f'SELECT COUNT(*) FROM "{table}" WHERE thread_id = ?', (thread_id,)
+        ).fetchone()[0]
+
+
+def assigned_thread(path: Path, job_id: str) -> str | None:
+    with sqlite3.connect(path) as db:
+        return db.execute(
+            "SELECT assigned_thread_id FROM agent_job_items WHERE id = ?", (job_id,)
+        ).fetchone()[0]
+
+
+def memory_count(path: Path, thread_id: str) -> int:
+    with sqlite3.connect(path) as db:
+        return db.execute(
+            "SELECT COUNT(*) FROM stage1_outputs WHERE thread_id = ?", (thread_id,)
+        ).fetchone()[0]
+
+
+def test_apply_deletion_removes_rows_and_file_and_keeps_backup(tmp_path: Path) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    plan = build_deletion_plan(fixture.home, "thread-1")
+
+    result: DeletionResult = apply_deletion(plan, process_checker=lambda: [])
+
+    assert thread_count(fixture.state, "thread-1") == 0
+    assert related_count(fixture.state, "thread_goals", "thread-1") == 0
+    assert assigned_thread(fixture.state, "job-1") is None
+    assert memory_count(fixture.memories, "thread-1") == 0
+    assert not fixture.rollout.exists()
+    assert result.backup_dir.joinpath("manifest.json").is_file()
+    manifest = json.loads(result.backup_dir.joinpath("manifest.json").read_text())
+    assert manifest["action"] == "delete"
+    assert manifest["session_id"] == "thread-1"
+
+
+def test_apply_deletion_refuses_concurrent_database_change(tmp_path: Path) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    plan = build_deletion_plan(fixture.home, "thread-1")
+    with sqlite3.connect(fixture.state) as db:
+        db.execute("UPDATE threads SET title='changed' WHERE id='thread-1'")
+
+    with pytest.raises(ConcurrentChangeError):
+        apply_deletion(plan, process_checker=lambda: [])
+
+    assert fixture.rollout.exists()
+
+
+def test_apply_deletion_rolls_back_when_file_remove_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    original = fixture.rollout.read_bytes()
+    plan = build_deletion_plan(fixture.home, "thread-1")
+
+    def fail_remove(path: Path) -> None:
+        raise OSError("simulated remove failure")
+
+    monkeypatch.setattr(storage, "_remove_file", fail_remove)
+    with pytest.raises(ApplyError, match="restored"):
+        apply_deletion(plan, process_checker=lambda: [])
+
+    assert thread_count(fixture.state, "thread-1") == 1
+    assert fixture.rollout.read_bytes() == original
+
+
+def test_apply_deletion_refuses_running_codex(tmp_path: Path) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    plan = build_deletion_plan(fixture.home, "thread-1")
+
+    with pytest.raises(ProcessRunningError):
+        apply_deletion(plan, process_checker=lambda: ["Codex"])
 
 
 def test_build_deletion_plan_finds_all_related_data(tmp_path: Path) -> None:
@@ -256,26 +346,19 @@ def test_deletion_plan_rejects_external_database_symlink(tmp_path: Path) -> None
 
     assert any(str(linked) in error and "symlink" in error for error in plan.errors)
     assert all(action.path != linked for action in plan.database_actions)
-    assert all(
-        "external" not in repr(action.original_rows) for action in plan.database_actions
-    )
+    assert all("external" not in repr(action.original_rows) for action in plan.database_actions)
 
 
 def test_deletion_plan_rejects_external_global_state_symlink(tmp_path: Path) -> None:
     fixture = create_delete_fixture(tmp_path)
     external = tmp_path / "external-global.json"
-    external.write_text(
-        json.dumps({"thread-workspace-root-hints": {"thread-1": "external"}})
-    )
+    external.write_text(json.dumps({"thread-workspace-root-hints": {"thread-1": "external"}}))
     fixture.global_state.unlink()
     fixture.global_state.symlink_to(external)
 
     plan = build_deletion_plan(fixture.home, "thread-1")
 
-    assert any(
-        str(fixture.global_state) in error and "symlink" in error
-        for error in plan.errors
-    )
+    assert any(str(fixture.global_state) in error and "symlink" in error for error in plan.errors)
     assert not plan.file_updates
 
 
