@@ -31,7 +31,9 @@ def test_apply_updates_all_stores_creates_backup_and_is_idempotent(tmp_path: Pat
     result = apply_plan(plan, process_checker=lambda: [])
 
     assert read_thread_cwd(state) == str(new)
-    assert str(new) in rollout.read_text()
+    rollout_items = [json.loads(line) for line in rollout.read_text().splitlines()]
+    assert rollout_items[0]["payload"]["cwd"] == str(new)
+    assert str(new / "src") in rollout_items[1]["payload"]["text"]
     with sqlite3.connect(home / "memories_1.sqlite") as db:
         memory = db.execute(
             "SELECT raw_memory FROM stage1_outputs WHERE thread_id='thread-1'"
