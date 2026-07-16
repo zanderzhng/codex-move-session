@@ -25,6 +25,12 @@ from .delete import (
     _thread_rollout_references,
 )
 from .planner import DatabaseChange, MigrationPlan
+from .windows_file import (
+    delete_file_by_fd as _delete_windows_file,
+)
+from .windows_file import (
+    open_file_for_delete as _open_windows_delete_fd,
+)
 
 
 class PlanValidationError(RuntimeError):
@@ -87,7 +93,18 @@ def _supports_secure_dir_fd() -> bool:
         and os.open in supports_dir_fd
         and os.stat in supports_dir_fd
         and os.unlink in supports_dir_fd
+        and os.rename in supports_dir_fd
+        and os.link in supports_dir_fd
     )
+
+
+def _uses_windows_handle_delete() -> bool:
+    return os.name == "nt"
+
+
+def _is_link_or_junction(path: Path, info: os.stat_result) -> bool:
+    is_junction = getattr(path, "is_junction", None)
+    return stat.S_ISLNK(info.st_mode) or bool(is_junction and is_junction())
 
 
 def _planned_relative_parts(home: Path, path: Path, *, rollout: bool) -> tuple[str, ...]:
@@ -110,14 +127,14 @@ def _validate_fallback_parent(home: Path, path: Path, *, rollout: bool) -> None:
     parts = _planned_relative_parts(home, path, rollout=rollout)
     try:
         home_info = home.lstat()
-        if stat.S_ISLNK(home_info.st_mode) or not stat.S_ISDIR(home_info.st_mode):
+        if _is_link_or_junction(home, home_info) or not stat.S_ISDIR(home_info.st_mode):
             raise ConcurrentChangeError(f"CODEX_HOME is not a real directory: {home}")
         resolved_home = home.resolve(strict=True)
         current = home
         for part in parts[:-1]:
             current /= part
             info = current.lstat()
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            if _is_link_or_junction(current, info) or not stat.S_ISDIR(info.st_mode):
                 raise ConcurrentChangeError(f"file has unsafe ancestry: {path}")
         resolved_parent = path.parent.resolve(strict=True)
     except (OSError, RuntimeError) as error:
@@ -288,9 +305,12 @@ def _open_planned_file(
         else:
             _validate_fallback_parent(home, path, rollout=deletion is not None)
             name = path.name
-            file_fd = os.open(path, file_flags)
+            if deletion is not None and _uses_windows_handle_delete():
+                file_fd = _open_windows_delete_fd(path)
+            else:
+                file_fd = os.open(path, file_flags)
             path_info = path.lstat()
-            if stat.S_ISLNK(path_info.st_mode):
+            if _is_link_or_junction(path, path_info):
                 raise ConcurrentChangeError(f"file is a symlink: {path}")
         file_info = os.fstat(file_fd)
         if not stat.S_ISREG(file_info.st_mode):
@@ -525,7 +545,13 @@ def _remove_file(path: Path, *, dir_fd: int | None = None) -> None:
     os.unlink(path, dir_fd=dir_fd)
 
 
-def _atomic_write_at(parent_fd: int, name: str, content: bytes, mode: int) -> tuple[int, int]:
+def _atomic_write_at(
+    parent_fd: int,
+    name: str,
+    content: bytes,
+    mode: int,
+    mutation_recorder: Callable[[tuple[int, int]], None] | None = None,
+) -> tuple[int, int]:
     temporary_name = f".{name}.{os.getpid()}.{os.urandom(8).hex()}"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     fd = os.open(temporary_name, flags, stat.S_IMODE(mode), dir_fd=parent_fd)
@@ -534,6 +560,10 @@ def _atomic_write_at(parent_fd: int, name: str, content: bytes, mode: int) -> tu
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
+        temporary_info = os.fstat(fd)
+        intended_identity = temporary_info.st_dev, temporary_info.st_ino
+        if mutation_recorder is not None:
+            mutation_recorder(intended_identity)
         os.replace(
             temporary_name,
             name,
@@ -541,7 +571,8 @@ def _atomic_write_at(parent_fd: int, name: str, content: bytes, mode: int) -> tu
             dst_dir_fd=parent_fd,
         )
         info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        return info.st_dev, info.st_ino
+        _verify_mutation_identity(intended_identity, (info.st_dev, info.st_ino))
+        return intended_identity
     finally:
         os.close(fd)
         with suppress(FileNotFoundError):
@@ -549,10 +580,21 @@ def _atomic_write_at(parent_fd: int, name: str, content: bytes, mode: int) -> tu
 
 
 def _atomic_write_opened(
-    home: Path, opened: _OpenPlannedFile, content: bytes, *, rollout: bool = False
+    home: Path,
+    opened: _OpenPlannedFile,
+    content: bytes,
+    *,
+    rollout: bool = False,
+    mutation_recorder: Callable[[tuple[int, int]], None] | None = None,
 ) -> tuple[int, int]:
     if opened.parent_fd >= 0:
-        return _atomic_write_at(opened.parent_fd, opened.name, content, opened.mode)
+        return _atomic_write_at(
+            opened.parent_fd,
+            opened.name,
+            content,
+            opened.mode,
+            mutation_recorder,
+        )
     _validate_fallback_parent(home, opened.path, rollout=rollout)
     current = opened.path.lstat()
     if (current.st_dev, current.st_ino) != (opened.device, opened.inode):
@@ -563,12 +605,38 @@ def _atomic_write_opened(
         current = opened.path.lstat()
         if (current.st_dev, current.st_ino) != (opened.device, opened.inode):
             raise ConcurrentChangeError(f"file identity changed before update: {opened.path}")
-    _atomic_write(opened.path, content)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{opened.path.name}.", dir=opened.path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb", closefd=False) as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, stat.S_IMODE(opened.mode))
+        temporary_info = os.fstat(fd)
+        intended_identity = temporary_info.st_dev, temporary_info.st_ino
+        if mutation_recorder is not None:
+            mutation_recorder(intended_identity)
+        os.close(fd)
+        fd = -1
+        os.replace(temporary, opened.path)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        temporary.unlink(missing_ok=True)
     _validate_fallback_parent(home, opened.path, rollout=rollout)
     updated = opened.path.lstat()
-    if stat.S_ISLNK(updated.st_mode) or not stat.S_ISREG(updated.st_mode):
+    if _is_link_or_junction(opened.path, updated) or not stat.S_ISREG(updated.st_mode):
         raise ConcurrentChangeError(f"updated file is no longer regular: {opened.path}")
-    return updated.st_dev, updated.st_ino
+    _verify_mutation_identity(intended_identity, (updated.st_dev, updated.st_ino))
+    return intended_identity
+
+
+def _verify_mutation_identity(intended: tuple[int, int], actual: tuple[int, int]) -> None:
+    if actual != intended:
+        raise ConcurrentChangeError(
+            f"atomic replacement identity changed: expected {intended}, found {actual}"
+        )
 
 
 def _remove_opened_file(home: Path, opened: _OpenPlannedFile) -> None:
@@ -579,13 +647,72 @@ def _remove_opened_file(home: Path, opened: _OpenPlannedFile) -> None:
     current = opened.path.lstat()
     if (current.st_dev, current.st_ino) != (opened.device, opened.inode):
         raise ConcurrentChangeError(f"file identity changed before delete: {opened.path}")
-    if os.name == "nt":
-        opened.close()
-        _validate_fallback_parent(home, opened.path, rollout=True)
-        current = opened.path.lstat()
-        if (current.st_dev, current.st_ino) != (opened.device, opened.inode):
-            raise ConcurrentChangeError(f"file identity changed before delete: {opened.path}")
+    if _uses_windows_handle_delete():
+        _delete_windows_file(opened.file_fd)
+        return
     _remove_file(opened.path)
+
+
+def _restore_deleted_file_exclusive(home: Path, item: FileDeletion) -> None:
+    if _supports_secure_dir_fd():
+        parent_fd, name = _open_safe_parent(home, item.path, rollout=True)
+        temporary_name = f".{name}.restore.{os.getpid()}.{os.urandom(8).hex()}"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        fd = -1
+        try:
+            fd = os.open(temporary_name, flags, item.original_mode, dir_fd=parent_fd)
+            with os.fdopen(fd, "wb", closefd=False) as handle:
+                handle.write(item.original)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.fchmod(fd, item.original_mode)
+            temporary_info = os.fstat(fd)
+            os.link(
+                temporary_name,
+                name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            restored = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            _verify_mutation_identity(
+                (temporary_info.st_dev, temporary_info.st_ino),
+                (restored.st_dev, restored.st_ino),
+            )
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            with suppress(FileNotFoundError):
+                os.unlink(temporary_name, dir_fd=parent_fd)
+            os.close(parent_fd)
+        return
+
+    _validate_fallback_parent(home, item.path, rollout=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    fd = os.open(item.path, flags, item.original_mode)
+    created_identity: tuple[int, int] | None = None
+    try:
+        created = os.fstat(fd)
+        created_identity = created.st_dev, created.st_ino
+        with os.fdopen(fd, "wb", closefd=False) as handle:
+            handle.write(item.original)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, item.original_mode)
+        else:
+            os.chmod(item.path, item.original_mode)
+    except BaseException:
+        if created_identity is not None:
+            with suppress(OSError):
+                current = item.path.lstat()
+                if (current.st_dev, current.st_ino) == created_identity:
+                    item.path.unlink()
+        raise
+    finally:
+        os.close(fd)
+    restored = item.path.lstat()
+    _verify_mutation_identity(created_identity, (restored.st_dev, restored.st_ino))
 
 
 def _open_deletion_transactions(
@@ -846,28 +973,7 @@ def _restore_deletion_files(
             try:
                 unchanged = _open_planned_file(plan.home, item.path, item.original, deletion=item)
             except ConcurrentChangeError:
-                if _supports_secure_dir_fd():
-                    parent_fd, name = _open_safe_parent(plan.home, item.path, rollout=True)
-                    try:
-                        try:
-                            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-                        except FileNotFoundError:
-                            _atomic_write_at(parent_fd, name, item.original, item.original_mode)
-                        else:
-                            raise ConcurrentChangeError(
-                                f"deleted rollout path was reused: {item.path}"
-                            )
-                    finally:
-                        os.close(parent_fd)
-                else:
-                    _validate_fallback_parent(plan.home, item.path, rollout=True)
-                    try:
-                        item.path.lstat()
-                    except FileNotFoundError:
-                        _atomic_write(item.path, item.original)
-                        os.chmod(item.path, item.original_mode)
-                    else:
-                        raise ConcurrentChangeError(f"deleted rollout path was reused: {item.path}")
+                _restore_deleted_file_exclusive(plan.home, item)
             else:
                 unchanged.close()
         except (ConcurrentChangeError, OSError) as error:
@@ -909,7 +1015,12 @@ def apply_deletion(
             )
             try:
                 mutated_identities[item.path] = _atomic_write_opened(
-                    plan.home, opened, item.updated
+                    plan.home,
+                    opened,
+                    item.updated,
+                    mutation_recorder=lambda identity, path=item.path: (
+                        mutated_identities.__setitem__(path, identity)
+                    ),
                 )
             finally:
                 opened.close()

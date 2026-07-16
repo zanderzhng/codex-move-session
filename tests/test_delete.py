@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import sqlite3
 import stat
 from dataclasses import dataclass, replace
@@ -276,6 +277,58 @@ def test_apply_deletion_uses_portable_file_fallback(
     assert thread_count(fixture.state, "thread-1") == 0
 
 
+def test_windows_fallback_deletes_through_open_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    plan = build_deletion_plan(fixture.home, "thread-1")
+    deletion = plan.file_deletions[0]
+    original_inode = fixture.rollout.stat().st_ino
+    external_sessions = tmp_path / "external-sessions"
+    external_rollout = external_sessions / "2026" / "07" / "thread-1.jsonl"
+    external_rollout.parent.mkdir(parents=True)
+    external_rollout.write_bytes(fixture.rollout.read_bytes())
+    native_delete_calls = 0
+
+    def native_open(path: Path) -> int:
+        return os.open(path, os.O_RDONLY)
+
+    def native_delete(fd: int) -> None:
+        nonlocal native_delete_calls
+        native_delete_calls += 1
+        assert os.fstat(fd).st_ino == original_inode
+        fixture.home.joinpath("sessions").rename(fixture.home / "original-sessions")
+        fixture.home.joinpath("sessions").symlink_to(external_sessions, target_is_directory=True)
+        fixture.home.joinpath("original-sessions", "2026", "07", "thread-1.jsonl").unlink()
+
+    monkeypatch.setattr(storage, "_supports_secure_dir_fd", lambda: False)
+    monkeypatch.setattr(storage, "_uses_windows_handle_delete", lambda: True, raising=False)
+    monkeypatch.setattr(storage, "_open_windows_delete_fd", native_open, raising=False)
+    monkeypatch.setattr(storage, "_delete_windows_file", native_delete, raising=False)
+
+    opened = storage._open_planned_file(
+        plan.home, deletion.path, deletion.original, deletion=deletion
+    )
+    try:
+        storage._remove_opened_file(plan.home, opened)
+    finally:
+        opened.close()
+
+    assert native_delete_calls == 1
+    assert external_rollout.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Win32 file handles")
+def test_windows_native_delete_branch(tmp_path: Path) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    plan = build_deletion_plan(fixture.home, "thread-1")
+
+    apply_deletion(plan, process_checker=lambda: [])
+
+    assert not fixture.rollout.exists()
+    assert thread_count(fixture.state, "thread-1") == 0
+
+
 def test_apply_deletion_refuses_rollout_shared_after_preview(tmp_path: Path) -> None:
     fixture = create_delete_fixture(tmp_path)
     plan = build_deletion_plan(fixture.home, "thread-1")
@@ -476,6 +529,33 @@ def test_apply_deletion_refuses_update_replacement_during_rollback(
     assert fixture.rollout.exists()
 
 
+def test_apply_deletion_rolls_back_when_post_replace_identity_check_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    original_global_state = fixture.global_state.read_bytes()
+    plan = build_deletion_plan(fixture.home, "thread-1")
+    checks = 0
+
+    def fail_first_identity_check(*_args: object) -> None:
+        nonlocal checks
+        checks += 1
+        if checks == 1:
+            raise ConcurrentChangeError("simulated post-replace identity failure")
+
+    monkeypatch.setattr(
+        storage, "_verify_mutation_identity", fail_first_identity_check, raising=False
+    )
+
+    with pytest.raises(ApplyError, match="touched data restored"):
+        apply_deletion(plan, process_checker=lambda: [])
+
+    assert checks >= 1
+    assert fixture.global_state.read_bytes() == original_global_state
+    assert_delete_fixture_restored(fixture)
+    assert fixture.rollout.exists()
+
+
 def test_apply_deletion_checks_exact_rows_inside_transaction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -522,6 +602,37 @@ def test_apply_deletion_rolls_back_when_verification_fails(
     assert stat.S_IMODE(fixture.rollout.stat().st_mode) == original_rollout_mode
     assert fixture.global_state.read_bytes() == original_global_state
     assert raised.value.backup_dir.joinpath("manifest.json").is_file()
+
+
+def test_apply_deletion_does_not_overwrite_reused_rollout_during_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    plan = build_deletion_plan(fixture.home, "thread-1")
+    competitor = b"created concurrently\n"
+    original_restore = getattr(storage, "_restore_deleted_file_exclusive", None)
+
+    def create_competitor_before_restore(home: Path, deletion: object) -> None:
+        deletion.path.write_bytes(competitor)
+        assert original_restore is not None
+        original_restore(home, deletion)
+
+    def fail_verification(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("simulated verification failure")
+
+    monkeypatch.setattr(storage, "_verify_deletion", fail_verification)
+    monkeypatch.setattr(
+        storage,
+        "_restore_deleted_file_exclusive",
+        create_competitor_before_restore,
+        raising=False,
+    )
+
+    with pytest.raises(ApplyError, match="rollback was incomplete"):
+        apply_deletion(plan, process_checker=lambda: [])
+
+    assert fixture.rollout.read_bytes() == competitor
+    assert_delete_fixture_restored(fixture)
 
 
 def test_apply_deletion_rolls_back_when_database_apply_fails(
