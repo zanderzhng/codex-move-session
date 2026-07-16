@@ -4,6 +4,8 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+
 from codex_move_session.delete import build_deletion_plan
 
 
@@ -227,3 +229,106 @@ def test_deletion_plan_does_not_create_sqlite_sidecars(tmp_path: Path) -> None:
 
     after = {path.relative_to(fixture.home) for path in fixture.home.rglob("*")}
     assert after == before
+
+
+def test_deletion_plan_rejects_external_database_symlink(tmp_path: Path) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    external = tmp_path / "external.sqlite"
+    with sqlite3.connect(external) as db:
+        _create_thread_tables(db)
+        db.execute(
+            "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "thread-1",
+                "External copy",
+                str(tmp_path / "external-project"),
+                0,
+                50,
+                str(fixture.rollout),
+                "{}",
+            ),
+        )
+        db.execute("INSERT INTO thread_goals VALUES ('thread-1', 'external')")
+    linked = fixture.home / "state_5.sqlite"
+    linked.symlink_to(external)
+
+    plan = build_deletion_plan(fixture.home, "thread-1")
+
+    assert any(str(linked) in error and "symlink" in error for error in plan.errors)
+    assert all(action.path != linked for action in plan.database_actions)
+    assert all(
+        "external" not in repr(action.original_rows) for action in plan.database_actions
+    )
+
+
+def test_deletion_plan_rejects_external_global_state_symlink(tmp_path: Path) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    external = tmp_path / "external-global.json"
+    external.write_text(
+        json.dumps({"thread-workspace-root-hints": {"thread-1": "external"}})
+    )
+    fixture.global_state.unlink()
+    fixture.global_state.symlink_to(external)
+
+    plan = build_deletion_plan(fixture.home, "thread-1")
+
+    assert any(
+        str(fixture.global_state) in error and "symlink" in error
+        for error in plan.errors
+    )
+    assert not plan.file_updates
+
+
+def test_deletion_plan_reports_discovery_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = create_delete_fixture(tmp_path)
+
+    def fail_discovery(_home: Path) -> list[object]:
+        raise RuntimeError("snapshot changed")
+
+    monkeypatch.setattr("codex_move_session.delete.discover_sessions", fail_discovery)
+
+    plan = build_deletion_plan(fixture.home, "thread-1")
+
+    assert plan.session is None
+    assert any("could not discover sessions" in error for error in plan.errors)
+
+
+def test_deletion_plan_reports_rollout_stat_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    original_lstat = Path.lstat
+
+    def fail_rollout_lstat(path: Path, *args: object, **kwargs: object):
+        if path == fixture.rollout:
+            raise PermissionError("denied")
+        return original_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", fail_rollout_lstat)
+
+    plan = build_deletion_plan(fixture.home, "thread-1")
+
+    assert any("could not inspect rollout path" in error for error in plan.errors)
+    assert not plan.warnings
+    assert not plan.file_deletions
+
+
+def test_deletion_plan_reports_rollout_resolve_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    original_resolve = Path.resolve
+
+    def fail_rollout_resolve(path: Path, *args: object, **kwargs: object) -> Path:
+        if path == fixture.rollout:
+            raise RuntimeError("symlink loop")
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", fail_rollout_resolve)
+
+    plan = build_deletion_plan(fixture.home, "thread-1")
+
+    assert any("could not resolve rollout path" in error for error in plan.errors)
+    assert not plan.file_deletions

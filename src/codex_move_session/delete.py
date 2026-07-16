@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -83,10 +84,101 @@ _TABLE_ACTIONS: tuple[
 )
 
 
-def _database_paths(home: Path) -> list[Path]:
-    paths = set(candidate_session_databases(home))
-    paths.update(path for path in home.glob("memories_*.sqlite") if path.is_file())
-    return sorted(paths)
+def _database_paths(home: Path, errors: list[str]) -> list[Path]:
+    sqlite_dir = home / "sqlite"
+    legacy = home / "state_5.sqlite"
+    candidates: set[Path] = set()
+    can_use_discovery_candidates = True
+
+    try:
+        sqlite_info = sqlite_dir.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        errors.append(f"could not inspect database directory {sqlite_dir}: {error}")
+        can_use_discovery_candidates = False
+    else:
+        if stat.S_ISLNK(sqlite_info.st_mode):
+            errors.append(f"database directory is a symlink: {sqlite_dir}")
+            can_use_discovery_candidates = False
+        elif not stat.S_ISDIR(sqlite_info.st_mode):
+            errors.append(f"database path is not a directory: {sqlite_dir}")
+            can_use_discovery_candidates = False
+        else:
+            try:
+                candidates.update(
+                    path
+                    for path in sqlite_dir.iterdir()
+                    if path.suffix.casefold() in {".db", ".sqlite", ".sqlite3"}
+                )
+            except OSError as error:
+                errors.append(f"could not inspect database directory {sqlite_dir}: {error}")
+                can_use_discovery_candidates = False
+
+    try:
+        legacy.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        errors.append(f"could not inspect database path {legacy}: {error}")
+        can_use_discovery_candidates = False
+    else:
+        candidates.add(legacy)
+        if legacy.is_symlink():
+            can_use_discovery_candidates = False
+
+    if can_use_discovery_candidates:
+        try:
+            candidates.update(candidate_session_databases(home))
+        except OSError as error:
+            errors.append(f"could not enumerate session databases: {error}")
+
+    try:
+        candidates.update(home.glob("memories_*.sqlite"))
+    except OSError as error:
+        errors.append(f"could not enumerate memory databases in {home}: {error}")
+
+    paths: list[Path] = []
+    for path in sorted(candidates):
+        try:
+            info = path.lstat()
+        except FileNotFoundError as error:
+            errors.append(f"database path disappeared during planning {path}: {error}")
+            continue
+        except OSError as error:
+            errors.append(f"could not inspect database path {path}: {error}")
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            errors.append(f"database path is a symlink: {path}")
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            errors.append(f"database path is not a regular file: {path}")
+            continue
+        try:
+            resolved = path.resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            errors.append(f"could not resolve database path {path}: {error}")
+            continue
+        allowed = (
+            (path == legacy and resolved == legacy)
+            or (
+                path.parent == sqlite_dir
+                and resolved.parent == sqlite_dir
+                and path.name == resolved.name
+            )
+            or (
+                path.parent == home
+                and path.name.startswith("memories_")
+                and path.suffix == ".sqlite"
+                and resolved.parent == home
+                and path.name == resolved.name
+            )
+        )
+        if not allowed:
+            errors.append(f"database path is outside its permitted location: {path}")
+            continue
+        paths.append(path)
+    return paths
 
 
 def _read_action(
@@ -150,13 +242,19 @@ def _is_within(path: Path, root: Path) -> bool:
 
 
 def _allowed_rollout(path: Path, home: Path) -> bool:
-    if not path.is_absolute() or path.is_symlink():
+    if not path.is_absolute():
         return False
-    resolved = path.resolve()
-    return any(
-        _is_within(resolved, root.resolve())
-        for root in (home / "sessions", home / "archived_sessions")
-    )
+    try:
+        info = path.lstat()
+        resolved = path.resolve()
+        roots = (home / "sessions", home / "archived_sessions")
+        return (
+            stat.S_ISREG(info.st_mode)
+            and not stat.S_ISLNK(info.st_mode)
+            and any(_is_within(resolved, root.resolve()) for root in roots)
+        )
+    except (OSError, RuntimeError):
+        return False
 
 
 def _plan_rollout_deletions(
@@ -167,11 +265,24 @@ def _plan_rollout_deletions(
     warnings: list[str],
     errors: list[str],
 ) -> list[FileDeletion]:
-    shared_paths = {
-        Path(value).resolve()
-        for thread_id, value in references
-        if thread_id != session_id and Path(value).is_absolute()
-    }
+    try:
+        allowed_roots = tuple(
+            root.resolve() for root in (home / "sessions", home / "archived_sessions")
+        )
+    except (OSError, RuntimeError) as error:
+        errors.append(f"could not resolve Codex session directories: {error}")
+        return []
+    shared_paths: set[Path] = set()
+    for thread_id, value in references:
+        if thread_id == session_id:
+            continue
+        try:
+            shared_paths.add(Path(value).resolve())
+        except (OSError, RuntimeError) as error:
+            errors.append(
+                f"could not resolve rollout path referenced by session {thread_id}: "
+                f"{value}: {error}"
+            )
     deletions: list[FileDeletion] = []
     seen: set[Path] = set()
     for value in sorted(selected_paths):
@@ -179,27 +290,53 @@ def _plan_rollout_deletions(
         if not path.is_absolute():
             errors.append(f"rollout path is not absolute: {path}")
             continue
-        if path.is_symlink():
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            try:
+                resolved = path.resolve()
+            except FileNotFoundError:
+                warnings.append(f"rollout file not found: {path}")
+                continue
+            except (OSError, RuntimeError) as error:
+                errors.append(f"could not resolve rollout path {path}: {error}")
+                continue
+            if not any(_is_within(resolved, root) for root in allowed_roots):
+                errors.append(f"rollout path is outside the Codex session directories: {path}")
+            else:
+                warnings.append(f"rollout file not found: {path}")
+            continue
+        except OSError as error:
+            errors.append(f"could not inspect rollout path {path}: {error}")
+            continue
+        if stat.S_ISLNK(info.st_mode):
             errors.append(f"rollout path is a symlink: {path}")
             continue
-        resolved = path.resolve()
+        if not stat.S_ISREG(info.st_mode):
+            errors.append(f"rollout path is not a regular file: {path}")
+            continue
+        try:
+            resolved = path.resolve()
+        except FileNotFoundError:
+            warnings.append(f"rollout file not found: {path}")
+            continue
+        except (OSError, RuntimeError) as error:
+            errors.append(f"could not resolve rollout path {path}: {error}")
+            continue
         if resolved in seen:
             continue
         seen.add(resolved)
-        if not _allowed_rollout(path, home):
+        if not any(_is_within(resolved, root) for root in allowed_roots):
             errors.append(f"rollout path is outside the Codex session directories: {path}")
             continue
         if resolved in shared_paths:
             errors.append(f"rollout file is referenced by another session: {path}")
             continue
-        if not path.exists():
-            warnings.append(f"rollout file not found: {path}")
-            continue
-        if not path.is_file():
-            errors.append(f"rollout path is not a regular file: {path}")
-            continue
         try:
             original = path.read_bytes()
+        except FileNotFoundError:
+            warnings.append(f"rollout file not found: {path}")
+            continue
         except OSError as error:
             errors.append(f"could not read rollout file {path}: {error}")
             continue
@@ -217,9 +354,17 @@ def _plan_global_state(
     home: Path, session_id: str, errors: list[str]
 ) -> FileChange | None:
     path = home / ".codex-global-state.json"
-    if not path.exists():
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
         return None
-    if not path.is_file():
+    except OSError as error:
+        errors.append(f"could not inspect global state {path}: {error}")
+        return None
+    if stat.S_ISLNK(info.st_mode):
+        errors.append(f"global state is a symlink: {path}")
+        return None
+    if not stat.S_ISREG(info.st_mode):
         errors.append(f"{path}: expected a regular file")
         return None
     try:
@@ -259,16 +404,22 @@ def _plan_global_state(
 
 def build_deletion_plan(home: Path, session_id: str) -> DeletionPlan:
     home = home.expanduser().resolve()
-    session = next(
-        (item for item in discover_sessions(home) if item.id == session_id),
-        None,
-    )
     database_actions: list[DatabaseAction] = []
     warnings: list[str] = []
     errors: list[str] = []
     references: list[tuple[str, str]] = []
+    database_paths = _database_paths(home, errors)
+    session: Session | None = None
+    if not errors:
+        try:
+            session = next(
+                (item for item in discover_sessions(home) if item.id == session_id),
+                None,
+            )
+        except (OSError, RuntimeError, sqlite3.Error) as error:
+            errors.append(f"could not discover sessions: {error}")
 
-    for path in _database_paths(home):
+    for path in database_paths:
         try:
             with open_sqlite_snapshot(path) as db:
                 for table, action, where_clause, required_columns in _TABLE_ACTIONS:
