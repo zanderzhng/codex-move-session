@@ -115,11 +115,14 @@ Each backup contains `manifest.json`, standalone SQLite snapshots, and the origi
 changed file. Backups can contain private conversations and local paths; do not publish them.
 
 Session deletion uses the same safeguards. `--delete` is a dry-run unless `--apply` is present, and
-apply refuses to proceed while Codex is running or if databases or files changed after the preview.
-Before deletion, it backs up the affected databases, rollout file, and other changed Codex state.
-After writing, it verifies database integrity, confirms the planned rows and rollout file are gone,
-and checks the remaining file updates. If deletion or verification fails, it rolls back every
-touched store from the backup and reports if any rollback step could not be completed.
+apply refuses to proceed while Codex is running or if the planned database rows or files changed
+after the preview. It also rechecks the database set and refuses to delete a rollout shared by
+another session. Before deletion, it backs up the affected databases, rollout file, and other changed
+Codex state. After writing, it verifies database integrity, confirms the planned rows and rollout
+file are gone, and checks the remaining file updates. If deletion or verification fails, open
+transactions, captured original file content, and scoped original-row restoration automatically
+roll back the touched session data. The retained backup remains available for audit or recovery, and
+the tool reports if any automatic rollback step could not be completed.
 
 ## Development
 
