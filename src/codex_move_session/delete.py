@@ -36,6 +36,9 @@ class FileDeletion:
     path: Path
     original: bytes
     original_digest: str
+    original_device: int
+    original_inode: int
+    original_mode: int
 
 
 @dataclass(frozen=True)
@@ -60,14 +63,10 @@ class DeletionPlan:
 
     @property
     def cleared_assignments(self) -> int:
-        return sum(
-            action.row_count for action in self.database_actions if action.action == "clear"
-        )
+        return sum(action.row_count for action in self.database_actions if action.action == "clear")
 
 
-_TABLE_ACTIONS: tuple[
-    tuple[str, DatabaseActionKind, str, tuple[str, ...]], ...
-] = (
+_TABLE_ACTIONS: tuple[tuple[str, DatabaseActionKind, str, tuple[str, ...]], ...] = (
     ("thread_dynamic_tools", "delete", "thread_id = ?", ("thread_id",)),
     ("thread_goals", "delete", "thread_id = ?", ("thread_id",)),
     (
@@ -203,9 +202,7 @@ def _read_action(
         sorted(
             (
                 tuple(row)
-                for row in db.execute(
-                    f'SELECT * FROM "{table}" WHERE {where_clause}', params
-                )
+                for row in db.execute(f'SELECT * FROM "{table}" WHERE {where_clause}', params)
             ),
             key=repr,
         )
@@ -257,6 +254,52 @@ def _allowed_rollout(path: Path, home: Path) -> bool:
         return False
 
 
+def _safe_session_roots(home: Path, errors: list[str]) -> tuple[Path, ...]:
+    roots: list[Path] = []
+    for root in (home / "sessions", home / "archived_sessions"):
+        try:
+            info = root.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            errors.append(f"could not inspect session directory {root}: {error}")
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            errors.append(f"session directory is a symlink: {root}")
+            continue
+        if not stat.S_ISDIR(info.st_mode):
+            errors.append(f"session directory is not a directory: {root}")
+            continue
+        try:
+            resolved = root.resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            errors.append(f"could not resolve session directory {root}: {error}")
+            continue
+        if resolved.parent != home or resolved.name != root.name:
+            errors.append(f"session directory is outside CODEX_HOME: {root}")
+            continue
+        roots.append(root)
+    return tuple(roots)
+
+
+def _has_symlinked_ancestry(path: Path, root: Path) -> bool:
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return True
+    current = root
+    for part in relative.parts[:-1]:
+        if part in {"", ".", ".."}:
+            return True
+        current /= part
+        try:
+            if stat.S_ISLNK(current.lstat().st_mode):
+                return True
+        except OSError:
+            return True
+    return False
+
+
 def _plan_rollout_deletions(
     home: Path,
     session_id: str,
@@ -265,13 +308,7 @@ def _plan_rollout_deletions(
     warnings: list[str],
     errors: list[str],
 ) -> list[FileDeletion]:
-    try:
-        allowed_roots = tuple(
-            root.resolve() for root in (home / "sessions", home / "archived_sessions")
-        )
-    except (OSError, RuntimeError) as error:
-        errors.append(f"could not resolve Codex session directories: {error}")
-        return []
+    allowed_roots = _safe_session_roots(home, errors)
     shared_paths: set[Path] = set()
     for thread_id, value in references:
         if thread_id == session_id:
@@ -326,7 +363,12 @@ def _plan_rollout_deletions(
         if resolved in seen:
             continue
         seen.add(resolved)
-        if not any(_is_within(resolved, root) for root in allowed_roots):
+        lexical_root = next((root for root in allowed_roots if _is_within(path, root)), None)
+        if lexical_root is not None and _has_symlinked_ancestry(path, lexical_root):
+            errors.append(f"rollout path has symlinked ancestry: {path}")
+            continue
+        containing_root = next((root for root in allowed_roots if _is_within(resolved, root)), None)
+        if containing_root is None:
             errors.append(f"rollout path is outside the Codex session directories: {path}")
             continue
         if resolved in shared_paths:
@@ -345,14 +387,15 @@ def _plan_rollout_deletions(
                 path=path,
                 original=original,
                 original_digest=hashlib.sha256(original).hexdigest(),
+                original_device=info.st_dev,
+                original_inode=info.st_ino,
+                original_mode=stat.S_IMODE(info.st_mode),
             )
         )
     return deletions
 
 
-def _plan_global_state(
-    home: Path, session_id: str, errors: list[str]
-) -> FileChange | None:
+def _plan_global_state(home: Path, session_id: str, errors: list[str]) -> FileChange | None:
     path = home / ".codex-global-state.json"
     try:
         info = path.lstat()

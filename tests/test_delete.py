@@ -1,7 +1,8 @@
 import hashlib
 import json
 import sqlite3
-from dataclasses import dataclass
+import stat
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ from codex_move_session.storage import (
     ApplyError,
     ConcurrentChangeError,
     DeletionResult,
+    PlanValidationError,
     ProcessRunningError,
     apply_deletion,
 )
@@ -121,8 +123,31 @@ def memory_count(path: Path, thread_id: str) -> int:
         ).fetchone()[0]
 
 
+def assert_delete_fixture_restored(fixture: DeleteFixture) -> None:
+    assert thread_count(fixture.state, "thread-1") == 1
+    for table in (
+        "thread_dynamic_tools",
+        "thread_goals",
+        "automation_runs",
+        "inbox_items",
+    ):
+        assert related_count(fixture.state, table, "thread-1") == 1
+    with sqlite3.connect(fixture.state) as db:
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM thread_spawn_edges "
+                "WHERE parent_thread_id='thread-1' OR child_thread_id='thread-1'"
+            ).fetchone()[0]
+            == 1
+        )
+    assert assigned_thread(fixture.state, "job-1") == "thread-1"
+    assert memory_count(fixture.memories, "thread-1") == 1
+
+
 def test_apply_deletion_removes_rows_and_file_and_keeps_backup(tmp_path: Path) -> None:
     fixture = create_delete_fixture(tmp_path)
+    original_rollout = fixture.rollout.read_bytes()
+    original_global_state = fixture.global_state.read_bytes()
     plan = build_deletion_plan(fixture.home, "thread-1")
 
     result: DeletionResult = apply_deletion(plan, process_checker=lambda: [])
@@ -136,6 +161,24 @@ def test_apply_deletion_removes_rows_and_file_and_keeps_backup(tmp_path: Path) -
     manifest = json.loads(result.backup_dir.joinpath("manifest.json").read_text())
     assert manifest["action"] == "delete"
     assert manifest["session_id"] == "thread-1"
+    assert {item["original"] for item in manifest["databases"]} == {
+        str(fixture.state),
+        str(fixture.memories),
+    }
+    assert {item["original"] for item in manifest["files"]} == {
+        str(fixture.rollout),
+        str(fixture.global_state),
+    }
+    backup_files = {
+        item["original"]: result.backup_dir / item["backup"] for item in manifest["files"]
+    }
+    assert backup_files[str(fixture.rollout)].read_bytes() == original_rollout
+    assert backup_files[str(fixture.global_state)].read_bytes() == original_global_state
+    backup_databases = {
+        item["original"]: result.backup_dir / item["backup"] for item in manifest["databases"]
+    }
+    assert thread_count(backup_databases[str(fixture.state)], "thread-1") == 1
+    assert memory_count(backup_databases[str(fixture.memories)], "thread-1") == 1
 
 
 def test_apply_deletion_refuses_concurrent_database_change(tmp_path: Path) -> None:
@@ -155,17 +198,22 @@ def test_apply_deletion_rolls_back_when_file_remove_fails(
 ) -> None:
     fixture = create_delete_fixture(tmp_path)
     original = fixture.rollout.read_bytes()
+    original_global_state = fixture.global_state.read_bytes()
     plan = build_deletion_plan(fixture.home, "thread-1")
 
-    def fail_remove(path: Path) -> None:
+    def fail_remove(path: Path, **_kwargs: object) -> None:
         raise OSError("simulated remove failure")
 
     monkeypatch.setattr(storage, "_remove_file", fail_remove)
     with pytest.raises(ApplyError, match="restored"):
         apply_deletion(plan, process_checker=lambda: [])
 
-    assert thread_count(fixture.state, "thread-1") == 1
+    assert_delete_fixture_restored(fixture)
     assert fixture.rollout.read_bytes() == original
+    assert fixture.global_state.read_bytes() == original_global_state
+    backups = list((fixture.home / "backups").iterdir())
+    assert len(backups) == 1
+    assert backups[0].joinpath("manifest.json").is_file()
 
 
 def test_apply_deletion_refuses_running_codex(tmp_path: Path) -> None:
@@ -174,6 +222,256 @@ def test_apply_deletion_refuses_running_codex(tmp_path: Path) -> None:
 
     with pytest.raises(ProcessRunningError):
         apply_deletion(plan, process_checker=lambda: ["Codex"])
+
+    assert_delete_fixture_restored(fixture)
+    assert fixture.rollout.exists()
+    assert fixture.global_state.exists()
+    assert not fixture.home.joinpath("backups").exists()
+
+
+def test_apply_deletion_refuses_rollout_shared_after_preview(tmp_path: Path) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    plan = build_deletion_plan(fixture.home, "thread-1")
+    with sqlite3.connect(fixture.state) as db:
+        db.execute(
+            "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("thread-2", "Keep", str(tmp_path), 0, 200, str(fixture.rollout), "{}"),
+        )
+
+    with pytest.raises(ConcurrentChangeError, match="referenced by another session"):
+        apply_deletion(plan, process_checker=lambda: [])
+
+    assert fixture.rollout.exists()
+    assert thread_count(fixture.state, "thread-1") == 1
+
+
+def test_apply_deletion_refuses_new_database_after_locking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    plan = build_deletion_plan(fixture.home, "thread-1")
+    original_open = storage._open_deletion_transactions
+
+    def add_database_after_locking(plan: object):
+        databases = original_open(plan)
+        late = fixture.home / "sqlite" / "late.sqlite"
+        with sqlite3.connect(late) as db:
+            _create_thread_tables(db)
+            db.execute(
+                "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("thread-2", "Keep", str(tmp_path), 0, 200, str(fixture.rollout), "{}"),
+            )
+        return databases
+
+    monkeypatch.setattr(storage, "_open_deletion_transactions", add_database_after_locking)
+
+    with pytest.raises(ApplyError, match="database set changed"):
+        apply_deletion(plan, process_checker=lambda: [])
+
+    assert fixture.rollout.exists()
+    assert_delete_fixture_restored(fixture)
+
+
+def test_apply_deletion_refuses_parent_redirect_after_preview(tmp_path: Path) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    plan = build_deletion_plan(fixture.home, "thread-1")
+    external_sessions = tmp_path / "external-sessions"
+    external_rollout = external_sessions / "2026" / "07" / "thread-1.jsonl"
+    external_rollout.parent.mkdir(parents=True)
+    external_rollout.write_bytes(fixture.rollout.read_bytes())
+    fixture.home.joinpath("sessions").rename(fixture.home / "original-sessions")
+    fixture.home.joinpath("sessions").symlink_to(external_sessions, target_is_directory=True)
+
+    with pytest.raises(ConcurrentChangeError, match="symlink"):
+        apply_deletion(plan, process_checker=lambda: [])
+
+    assert external_rollout.exists()
+    assert thread_count(fixture.state, "thread-1") == 1
+
+
+def test_apply_deletion_refuses_database_change_after_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    plan = build_deletion_plan(fixture.home, "thread-1")
+    original_backup = storage._create_deletion_backup
+
+    def change_after_backup(plan: object):
+        result = original_backup(plan)
+        with sqlite3.connect(fixture.state) as db:
+            db.execute("UPDATE threads SET title='changed' WHERE id='thread-1'")
+        return result
+
+    monkeypatch.setattr(storage, "_create_deletion_backup", change_after_backup)
+
+    with pytest.raises(ApplyError, match="restored"):
+        apply_deletion(plan, process_checker=lambda: [])
+
+    with sqlite3.connect(fixture.state) as db:
+        title = db.execute("SELECT title FROM threads WHERE id='thread-1'").fetchone()[0]
+        assert title == "changed"
+    assert fixture.rollout.exists()
+
+
+def test_apply_deletion_refuses_file_change_after_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    plan = build_deletion_plan(fixture.home, "thread-1")
+    original_backup = storage._create_deletion_backup
+
+    def change_after_backup(plan: object):
+        result = original_backup(plan)
+        fixture.rollout.write_text("changed by another process\n")
+        return result
+
+    monkeypatch.setattr(storage, "_create_deletion_backup", change_after_backup)
+
+    with pytest.raises(ApplyError, match="rollback was incomplete"):
+        apply_deletion(plan, process_checker=lambda: [])
+
+    assert fixture.rollout.read_text() == "changed by another process\n"
+    assert_delete_fixture_restored(fixture)
+
+
+def test_apply_deletion_refuses_file_identity_change_after_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    plan = build_deletion_plan(fixture.home, "thread-1")
+    original_backup = storage._create_deletion_backup
+    replacement_inode = 0
+
+    def replace_after_backup(plan: object):
+        nonlocal replacement_inode
+        result = original_backup(plan)
+        replacement = fixture.global_state.with_suffix(".replacement")
+        replacement.write_bytes(fixture.global_state.read_bytes())
+        replacement.replace(fixture.global_state)
+        replacement_inode = fixture.global_state.stat().st_ino
+        return result
+
+    monkeypatch.setattr(storage, "_create_deletion_backup", replace_after_backup)
+
+    with pytest.raises(ApplyError, match="restored"):
+        apply_deletion(plan, process_checker=lambda: [])
+
+    assert fixture.global_state.stat().st_ino == replacement_inode
+    assert_delete_fixture_restored(fixture)
+    assert fixture.rollout.exists()
+
+
+def test_apply_deletion_checks_exact_rows_inside_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    plan = build_deletion_plan(fixture.home, "thread-1")
+    original_read = storage._read_action_rows
+    changed = False
+
+    def change_inside_transaction(db: sqlite3.Connection, action: object):
+        nonlocal changed
+        if db.in_transaction and not changed and action.table == "threads":
+            db.execute("UPDATE threads SET title='changed' WHERE id='thread-1'")
+            changed = True
+        return original_read(db, action)
+
+    monkeypatch.setattr(storage, "_read_action_rows", change_inside_transaction)
+
+    with pytest.raises(ApplyError, match="restored"):
+        apply_deletion(plan, process_checker=lambda: [])
+
+    assert_delete_fixture_restored(fixture)
+    assert fixture.rollout.exists()
+
+
+def test_apply_deletion_rolls_back_when_verification_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    original_rollout = fixture.rollout.read_bytes()
+    original_rollout_mode = stat.S_IMODE(fixture.rollout.stat().st_mode)
+    original_global_state = fixture.global_state.read_bytes()
+    plan = build_deletion_plan(fixture.home, "thread-1")
+
+    def fail_verification(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("simulated verification failure")
+
+    monkeypatch.setattr(storage, "_verify_deletion", fail_verification)
+
+    with pytest.raises(ApplyError, match="restored") as raised:
+        apply_deletion(plan, process_checker=lambda: [])
+
+    assert_delete_fixture_restored(fixture)
+    assert fixture.rollout.read_bytes() == original_rollout
+    assert stat.S_IMODE(fixture.rollout.stat().st_mode) == original_rollout_mode
+    assert fixture.global_state.read_bytes() == original_global_state
+    assert raised.value.backup_dir.joinpath("manifest.json").is_file()
+
+
+def test_apply_deletion_rolls_back_when_database_apply_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    original_rollout = fixture.rollout.read_bytes()
+    original_global_state = fixture.global_state.read_bytes()
+    plan = build_deletion_plan(fixture.home, "thread-1")
+    original_apply = storage._apply_deletion_actions
+    calls = 0
+
+    def fail_database_apply(*args: object, **kwargs: object) -> None:
+        nonlocal calls
+        original_apply(*args, **kwargs)
+        calls += 1
+        if calls == 1:
+            raise sqlite3.OperationalError("simulated database failure")
+
+    monkeypatch.setattr(storage, "_apply_deletion_actions", fail_database_apply)
+
+    with pytest.raises(ApplyError, match="restored"):
+        apply_deletion(plan, process_checker=lambda: [])
+
+    assert_delete_fixture_restored(fixture)
+    assert fixture.rollout.read_bytes() == original_rollout
+    assert fixture.global_state.read_bytes() == original_global_state
+
+
+def test_apply_deletion_partial_commit_restores_only_touched_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    plan = build_deletion_plan(fixture.home, "thread-1")
+    original_commit = storage._commit_deletion_database
+
+    def fail_after_first_commit(db: sqlite3.Connection, path: Path) -> None:
+        if path == fixture.memories:
+            original_commit(db, path)
+            with sqlite3.connect(fixture.memories) as other:
+                other.execute("INSERT INTO stage1_outputs VALUES ('thread-2', 'unrelated')")
+            return
+        raise sqlite3.OperationalError("simulated commit failure")
+
+    monkeypatch.setattr(storage, "_commit_deletion_database", fail_after_first_commit)
+
+    with pytest.raises(ApplyError, match="restored"):
+        apply_deletion(plan, process_checker=lambda: [])
+
+    assert_delete_fixture_restored(fixture)
+    assert memory_count(fixture.memories, "thread-2") == 1
+    assert fixture.rollout.exists()
+
+
+def test_apply_deletion_rejects_invalid_database_action(tmp_path: Path) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    plan = build_deletion_plan(fixture.home, "thread-1")
+    actions = list(plan.database_actions)
+    actions[0] = replace(actions[0], table='threads"; DROP TABLE threads; --')
+    invalid_plan = replace(plan, database_actions=tuple(actions))
+
+    with pytest.raises(PlanValidationError, match="unsafe SQLite identifier"):
+        apply_deletion(invalid_plan, process_checker=lambda: [])
+
+    assert not fixture.home.joinpath("backups").exists()
 
 
 def test_build_deletion_plan_finds_all_related_data(tmp_path: Path) -> None:
@@ -275,6 +573,30 @@ def test_deletion_plan_rejects_symlinked_rollout(tmp_path: Path) -> None:
     plan = build_deletion_plan(fixture.home, "thread-1")
 
     assert any("symlink" in error for error in plan.errors)
+    assert not plan.file_deletions
+
+
+def test_deletion_plan_rejects_symlinked_session_root(tmp_path: Path) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    external_sessions = tmp_path / "external-sessions"
+    fixture.home.joinpath("sessions").rename(external_sessions)
+    fixture.home.joinpath("sessions").symlink_to(external_sessions, target_is_directory=True)
+
+    plan = build_deletion_plan(fixture.home, "thread-1")
+
+    assert any("session directory is a symlink" in error for error in plan.errors)
+    assert not plan.file_deletions
+
+
+def test_deletion_plan_rejects_symlinked_rollout_ancestry(tmp_path: Path) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    external_year = tmp_path / "external-year"
+    fixture.home.joinpath("sessions", "2026").rename(external_year)
+    fixture.home.joinpath("sessions", "2026").symlink_to(external_year, target_is_directory=True)
+
+    plan = build_deletion_plan(fixture.home, "thread-1")
+
+    assert any("symlinked ancestry" in error for error in plan.errors)
     assert not plan.file_deletions
 
 
