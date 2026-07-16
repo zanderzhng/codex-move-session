@@ -99,19 +99,41 @@ def test_plan_can_limit_move_to_one_session(tmp_path: Path) -> None:
     new.mkdir()
     state, _ = create_codex_fixture(home, old)
     sibling_rollout = insert_sibling_session(home, state, old, thread_id="thread-2")
+    (home / "cap_sid").write_text(json.dumps({"cwd": str(old)}))
 
     plan = build_plan(home, str(old), str(new), scope="all", session_id="thread-1")
 
     assert [session.id for session in plan.sessions] == ["thread-1"]
     assert {change.key for change in plan.database_changes} == {"thread-1"}
     assert all(change.path != sibling_rollout for change in plan.file_changes)
+    assert all(change.area != "cap_sid" for change in plan.file_changes)
     global_change = next(
         change for change in plan.file_changes if change.area == "global-state"
     )
     updated = json.loads(global_change.updated)
     assert updated["thread-workspace-root-hints"]["thread-1"] == str(new)
     assert updated["thread-workspace-root-hints"]["thread-2"] == str(old)
+    assert updated["electron-saved-workspace-roots"] == [str(old)]
     assert updated["project-order"] == [str(old)]
+
+
+def test_filtered_plan_reports_global_hint_key_collision(tmp_path: Path) -> None:
+    home = tmp_path / ".codex"
+    old = tmp_path / "old-project"
+    new = tmp_path / "new-project"
+    new.mkdir()
+    create_codex_fixture(home, old)
+    global_path = home / ".codex-global-state.json"
+    global_state = json.loads(global_path.read_text())
+    global_state["thread-workspace-root-hints"]["thread-1"] = {
+        str(old): "old",
+        str(new): "new",
+    }
+    global_path.write_text(json.dumps(global_state))
+
+    plan = build_plan(home, str(old), str(new), session_id="thread-1")
+
+    assert any(f"{global_path}: path-key collision" in error for error in plan.errors)
 
 
 def test_unfiltered_plan_still_moves_all_matching_sessions(tmp_path: Path) -> None:

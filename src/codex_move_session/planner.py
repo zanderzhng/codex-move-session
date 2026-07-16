@@ -287,7 +287,11 @@ def _plan_selected_thread_hint(
     hints = parsed.get("thread-workspace-root-hints")
     if not isinstance(hints, dict) or session_id not in hints:
         return None
-    updated_hint, count = _replace_json(hints[session_id], mapper)
+    try:
+        updated_hint, count = _replace_json(hints[session_id], mapper)
+    except PathKeyCollisionError as error:
+        errors.append(f"{path}: {error}")
+        return None
     if count == 0:
         return None
     updated = dict(parsed)
