@@ -272,6 +272,39 @@ def _plan_json_file(
     )
 
 
+def _plan_selected_thread_hint(
+    path: Path, session_id: str, mapper: PathMapper, errors: list[str]
+) -> FileChange | None:
+    original = path.read_bytes()
+    try:
+        parsed = json.loads(original)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        errors.append(f"{path}: invalid JSON: {error}")
+        return None
+    if not isinstance(parsed, dict):
+        errors.append(f"{path}: expected a JSON object")
+        return None
+    hints = parsed.get("thread-workspace-root-hints")
+    if not isinstance(hints, dict) or session_id not in hints:
+        return None
+    updated_hint, count = _replace_json(hints[session_id], mapper)
+    if count == 0:
+        return None
+    updated = dict(parsed)
+    updated_hints = dict(hints)
+    updated_hints[session_id] = updated_hint
+    updated["thread-workspace-root-hints"] = updated_hints
+    output = json.dumps(updated, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
+    return FileChange(
+        path=path,
+        area="global-state",
+        original=original,
+        updated=output,
+        original_digest=hashlib.sha256(original).hexdigest(),
+        replacements=count,
+    )
+
+
 def build_plan(
     home: Path,
     old: str,
@@ -279,6 +312,7 @@ def build_plan(
     *,
     include_archived: bool = False,
     scope: SessionScope | None = None,
+    session_id: str | None = None,
 ) -> MigrationPlan:
     home = home.expanduser().resolve()
     mapper = PathMapper(old, new)
@@ -291,6 +325,8 @@ def build_plan(
 
     effective_scope: SessionScope = scope or ("all" if include_archived else "active")
     for session in discover_sessions(home):
+        if session_id is not None and session.id != session_id:
+            continue
         if effective_scope == "active" and session.archived:
             continue
         if effective_scope == "archived" and not session.archived:
@@ -350,23 +386,26 @@ def build_plan(
 
     global_path = home / ".codex-global-state.json"
     if global_path.is_file():
-        change = _plan_json_file(
-            global_path,
-            mapper,
-            area="global-state",
-            keys=(
-                "electron-saved-workspace-roots",
-                "active-workspace-roots",
-                "project-order",
-                "electron-workspace-root-labels",
-                "thread-workspace-root-hints",
-            ),
-            errors=errors,
-        )
+        if session_id is not None:
+            change = _plan_selected_thread_hint(global_path, session_id, mapper, errors)
+        else:
+            change = _plan_json_file(
+                global_path,
+                mapper,
+                area="global-state",
+                keys=(
+                    "electron-saved-workspace-roots",
+                    "active-workspace-roots",
+                    "project-order",
+                    "electron-workspace-root-labels",
+                    "thread-workspace-root-hints",
+                ),
+                errors=errors,
+            )
         if change:
             file_changes.append(change)
     cap_sid = home / "cap_sid"
-    if cap_sid.is_file():
+    if session_id is None and cap_sid.is_file():
         change = _plan_json_file(
             cap_sid, mapper, area="cap_sid", keys=None, errors=errors
         )

@@ -62,6 +62,71 @@ def create_codex_fixture(home: Path, old: Path, *, archived: bool = False) -> tu
     return state, rollout
 
 
+def insert_sibling_session(home: Path, state: Path, old: Path, *, thread_id: str) -> Path:
+    rollout = home / "sessions" / "2026" / "01" / f"rollout-{thread_id}.jsonl"
+    rollout.write_text(
+        json.dumps({"type": "session_meta", "payload": {"id": thread_id, "cwd": str(old)}}) + "\n"
+    )
+    with sqlite3.connect(state) as db:
+        db.execute(
+            "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                thread_id,
+                "Sibling session",
+                str(old),
+                0,
+                200,
+                str(rollout),
+                json.dumps({"writable_roots": [str(old / "tmp")]}),
+            ),
+        )
+    with sqlite3.connect(home / "memories_1.sqlite") as db:
+        db.execute(
+            "INSERT INTO stage1_outputs VALUES (?, ?, ?)",
+            (thread_id, f"Files live in {old}/src", f"Worked from {old}"),
+        )
+    global_path = home / ".codex-global-state.json"
+    global_state = json.loads(global_path.read_text())
+    global_state["thread-workspace-root-hints"][thread_id] = str(old)
+    global_path.write_text(json.dumps(global_state))
+    return rollout
+
+
+def test_plan_can_limit_move_to_one_session(tmp_path: Path) -> None:
+    home = tmp_path / ".codex"
+    old = tmp_path / "old-project"
+    new = tmp_path / "new-project"
+    new.mkdir()
+    state, _ = create_codex_fixture(home, old)
+    sibling_rollout = insert_sibling_session(home, state, old, thread_id="thread-2")
+
+    plan = build_plan(home, str(old), str(new), scope="all", session_id="thread-1")
+
+    assert [session.id for session in plan.sessions] == ["thread-1"]
+    assert {change.key for change in plan.database_changes} == {"thread-1"}
+    assert all(change.path != sibling_rollout for change in plan.file_changes)
+    global_change = next(
+        change for change in plan.file_changes if change.area == "global-state"
+    )
+    updated = json.loads(global_change.updated)
+    assert updated["thread-workspace-root-hints"]["thread-1"] == str(new)
+    assert updated["thread-workspace-root-hints"]["thread-2"] == str(old)
+    assert updated["project-order"] == [str(old)]
+
+
+def test_unfiltered_plan_still_moves_all_matching_sessions(tmp_path: Path) -> None:
+    home = tmp_path / ".codex"
+    old = tmp_path / "old-project"
+    new = tmp_path / "new-project"
+    new.mkdir()
+    state, _ = create_codex_fixture(home, old)
+    insert_sibling_session(home, state, old, thread_id="thread-2")
+
+    plan = build_plan(home, str(old), str(new), scope="all")
+
+    assert {session.id for session in plan.sessions} == {"thread-1", "thread-2"}
+
+
 def test_plan_repairs_database_rollout_memory_and_global_state(tmp_path: Path) -> None:
     home = tmp_path / ".codex"
     old = tmp_path / "old-project"
