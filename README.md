@@ -33,9 +33,10 @@ Python 3.10 or newer is required.
 
 ## Usage
 
-Running without `--old` and `--new` opens the interactive workflow. It finds session working
-directories that no longer exist, lets you filter active or archived sessions, prompts for the new
-directory, displays every planned data store change, and asks for confirmation.
+Running without `--old`, `--new`, or `--delete` opens the interactive workflow. It finds session
+working directories that no longer exist, lets you filter active or archived sessions, select a
+session, and choose whether to move or delete it. The selected action displays every planned data
+store change and asks for confirmation before applying it.
 
 ```console
 codex-move-session
@@ -52,6 +53,21 @@ Close Codex, review the dry-run, then apply the same migration:
 ```console
 codex-move-session --old /previous/project --new /current/project --apply
 ```
+
+Delete one local session by ID. Deletion is also a dry-run by default:
+
+```console
+codex-move-session --delete SESSION_ID
+```
+
+After reviewing the deletion plan, apply it explicitly:
+
+```console
+codex-move-session --delete SESSION_ID --apply
+```
+
+Deletion removes the local session and related database rows, related memory, and its rollout file
+after creating a backup. It never deletes project files.
 
 Include archived sessions or select another Codex profile:
 
@@ -97,6 +113,13 @@ Dry-run is always the default. Apply mode:
 
 Each backup contains `manifest.json`, standalone SQLite snapshots, and the original content of every
 changed file. Backups can contain private conversations and local paths; do not publish them.
+
+Session deletion uses the same safeguards. `--delete` is a dry-run unless `--apply` is present, and
+apply refuses to proceed while Codex is running or if databases or files changed after the preview.
+Before deletion, it backs up the affected databases, rollout file, and other changed Codex state.
+After writing, it verifies database integrity, confirms the planned rows and rollout file are gone,
+and checks the remaining file updates. If deletion or verification fails, it rolls back every
+touched store from the backup and reports if any rollback step could not be completed.
 
 ## Development
 
