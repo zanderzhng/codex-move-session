@@ -161,6 +161,15 @@ def test_windows_writable_identity_access_includes_read_attributes() -> None:
     )
 
 
+def test_windows_rename_buffer_includes_aligned_header() -> None:
+    encoded_name = "target.json".encode("utf-16-le")
+
+    buffer = windows_file._build_rename_buffer(24, 20, encoded_name)
+
+    assert len(buffer) == 24 + len(encoded_name)
+    assert buffer[20 : 20 + len(encoded_name)] == encoded_name
+
+
 def test_apply_deletion_removes_rows_and_file_and_keeps_backup(tmp_path: Path) -> None:
     fixture = create_delete_fixture(tmp_path)
     original_rollout = fixture.rollout.read_bytes()
@@ -337,6 +346,9 @@ def test_apply_deletion_rechecks_process_before_mutation(tmp_path: Path) -> None
     assert fixture.rollout.exists()
 
 
+@pytest.mark.skipif(
+    os.name == "nt", reason="portable pathname replace cannot replace an open Windows target"
+)
 def test_apply_deletion_uses_portable_file_fallback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

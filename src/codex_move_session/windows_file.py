@@ -10,6 +10,12 @@ _FILE_READ_ATTRIBUTES = 0x00000080
 _WRITABLE_IDENTITY_ACCESS = _GENERIC_WRITE | _DELETE | _SYNCHRONIZE | _FILE_READ_ATTRIBUTES
 
 
+def _build_rename_buffer(header_size: int, name_offset: int, encoded_name: bytes) -> bytearray:
+    buffer = bytearray(max(header_size, name_offset) + len(encoded_name))
+    buffer[name_offset : name_offset + len(encoded_name)] = encoded_name
+    return buffer
+
+
 def _unsupported() -> OSError:
     return OSError("Windows file-handle operations are unavailable on this platform")
 
@@ -307,12 +313,14 @@ def _relative_file_identity(parent_handle: int, name: str) -> tuple[int, int]:
 def _rename_handle(handle: int, parent_handle: int, name: str) -> None:
     encoded_name = name.encode("utf-16-le")
     name_offset = _FileRenameInfoHeader.file_name_length.offset + ctypes.sizeof(wintypes.DWORD)
-    buffer = ctypes.create_string_buffer(name_offset + len(encoded_name))
+    raw_buffer = _build_rename_buffer(
+        ctypes.sizeof(_FileRenameInfoHeader), name_offset, encoded_name
+    )
+    buffer = ctypes.create_string_buffer(bytes(raw_buffer), len(raw_buffer))
     information = _FileRenameInfoHeader.from_buffer(buffer)
     information.replace_if_exists = True
     information.root_directory = parent_handle
     information.file_name_length = len(encoded_name)
-    ctypes.memmove(ctypes.addressof(buffer) + name_offset, encoded_name, len(encoded_name))
     if not _set_file_information(
         wintypes.HANDLE(handle),
         _FILE_RENAME_INFO_CLASS,
