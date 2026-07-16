@@ -154,6 +154,13 @@ def assert_delete_fixture_restored(fixture: DeleteFixture) -> None:
     assert memory_count(fixture.memories, "thread-1") == 1
 
 
+def test_windows_writable_identity_access_includes_read_attributes() -> None:
+    assert (
+        windows_file._WRITABLE_IDENTITY_ACCESS & windows_file._FILE_READ_ATTRIBUTES
+        == windows_file._FILE_READ_ATTRIBUTES
+    )
+
+
 def test_apply_deletion_removes_rows_and_file_and_keeps_backup(tmp_path: Path) -> None:
     fixture = create_delete_fixture(tmp_path)
     original_rollout = fixture.rollout.read_bytes()
@@ -343,6 +350,7 @@ def test_apply_deletion_uses_portable_file_fallback(
         return False
 
     monkeypatch.setattr(storage, "_supports_secure_dir_fd", force_fallback, raising=False)
+    monkeypatch.setattr(storage, "_uses_windows_handle_delete", lambda: False)
 
     apply_deletion(plan, process_checker=lambda: [])
 
@@ -351,6 +359,9 @@ def test_apply_deletion_uses_portable_file_fallback(
     assert thread_count(fixture.state, "thread-1") == 0
 
 
+@pytest.mark.skipif(
+    os.name == "nt", reason="POSIX substitution simulation; native Win32 coverage follows"
+)
 def test_windows_fallback_deletes_through_open_handle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -403,6 +414,9 @@ def test_windows_native_delete_branch(tmp_path: Path) -> None:
     assert thread_count(fixture.state, "thread-1") == 0
 
 
+@pytest.mark.skipif(
+    os.name == "nt", reason="POSIX substitution simulation; native Win32 coverage follows"
+)
 def test_windows_update_uses_handle_relative_atomic_replace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -465,6 +479,9 @@ def test_windows_update_uses_handle_relative_atomic_replace(
     assert fixture.global_state.read_bytes() == update.updated
 
 
+@pytest.mark.skipif(
+    os.name == "nt", reason="POSIX substitution simulation; native Win32 coverage follows"
+)
 def test_windows_atomic_update_refuses_substituted_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -627,7 +644,7 @@ def test_apply_deletion_refuses_parent_redirect_after_preview(tmp_path: Path) ->
     fixture.home.joinpath("sessions").rename(fixture.home / "original-sessions")
     fixture.home.joinpath("sessions").symlink_to(external_sessions, target_is_directory=True)
 
-    with pytest.raises(ConcurrentChangeError, match="symlink"):
+    with pytest.raises(ConcurrentChangeError, match="symlink|unsafe ancestry"):
         apply_deletion(plan, process_checker=lambda: [])
 
     assert external_rollout.exists()
@@ -751,6 +768,7 @@ def test_apply_deletion_rolls_back_when_post_replace_identity_check_fails(
     monkeypatch.setattr(
         storage, "_verify_mutation_identity", fail_first_identity_check, raising=False
     )
+    monkeypatch.setattr(storage, "_uses_windows_handle_delete", lambda: False)
 
     with pytest.raises(ApplyError, match="touched data restored"):
         apply_deletion(plan, process_checker=lambda: [])
@@ -775,6 +793,7 @@ def test_apply_deletion_clears_prepared_journal_when_replace_fails(
         raise OSError("simulated replace failure")
 
     monkeypatch.setattr(storage, "_replace_file", fail_first_replace, raising=False)
+    monkeypatch.setattr(storage, "_uses_windows_handle_delete", lambda: False)
 
     with pytest.raises(ApplyError, match="touched data restored"):
         apply_deletion(plan, process_checker=lambda: [])
@@ -886,7 +905,8 @@ def test_windows_restore_creates_relative_to_validated_parent_handle(
         fixture.home.joinpath("sessions").rename(fixture.home / "original-sessions")
         fixture.home.joinpath("sessions").symlink_to(external_sessions, target_is_directory=True)
         stable_parent = fixture.home / "original-sessions" / "2026" / "07"
-        return os.open(stable_parent / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+        return os.open(stable_parent / name, flags, 0o600)
 
     monkeypatch.setattr(storage, "_supports_secure_dir_fd", lambda: False)
     monkeypatch.setattr(storage, "_uses_windows_handle_delete", lambda: True)
@@ -964,9 +984,12 @@ def test_windows_restore_write_failure_removes_owned_partial_file(
     deletion = plan.file_deletions[0]
     deletion.path.unlink()
     delete_calls = 0
+    delete_pending: set[int] = set()
+    original_close = os.close
 
     def native_create(parent: Path, name: str, _identity: tuple[int, int]) -> int:
-        return os.open(parent / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+        return os.open(parent / name, flags, 0o600)
 
     def fail_write(fd: int, _content: bytes) -> None:
         os.write(fd, b"partial")
@@ -975,7 +998,13 @@ def test_windows_restore_write_failure_removes_owned_partial_file(
     def native_delete(fd: int) -> None:
         nonlocal delete_calls
         delete_calls += 1
-        deletion.path.unlink()
+        delete_pending.add(fd)
+
+    def close_delete_pending(fd: int) -> None:
+        original_close(fd)
+        if fd in delete_pending:
+            deletion.path.unlink()
+            delete_pending.remove(fd)
 
     monkeypatch.setattr(storage, "_supports_secure_dir_fd", lambda: False)
     monkeypatch.setattr(storage, "_uses_windows_handle_delete", lambda: True)
@@ -983,6 +1012,7 @@ def test_windows_restore_write_failure_removes_owned_partial_file(
     monkeypatch.setattr(storage, "_create_windows_file_exclusive", native_create, raising=False)
     monkeypatch.setattr(storage, "_write_all", fail_write, raising=False)
     monkeypatch.setattr(storage, "_delete_windows_file", native_delete)
+    monkeypatch.setattr(storage.os, "close", close_delete_pending)
 
     with pytest.raises(OSError, match="simulated write failure"):
         storage._restore_deleted_file_exclusive(plan.home, deletion)

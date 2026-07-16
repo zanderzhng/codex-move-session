@@ -3,6 +3,12 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+_GENERIC_WRITE = 0x40000000
+_DELETE = 0x00010000
+_SYNCHRONIZE = 0x00100000
+_FILE_READ_ATTRIBUTES = 0x00000080
+_WRITABLE_IDENTITY_ACCESS = _GENERIC_WRITE | _DELETE | _SYNCHRONIZE | _FILE_READ_ATTRIBUTES
+
 
 def _unsupported() -> OSError:
     return OSError("Windows file-handle operations are unavailable on this platform")
@@ -14,9 +20,6 @@ if os.name == "nt":
     from ctypes import wintypes
 
     _GENERIC_READ = 0x80000000
-    _GENERIC_WRITE = 0x40000000
-    _DELETE = 0x00010000
-    _SYNCHRONIZE = 0x00100000
     _FILE_LIST_DIRECTORY = 0x00000001
     _FILE_ADD_FILE = 0x00000002
     _FILE_SHARE_READ = 0x00000001
@@ -433,7 +436,7 @@ def atomic_replace_file(
         temporary_handle = _create_relative_handle(
             parent_handle,
             temporary_name,
-            _GENERIC_WRITE | _DELETE | _SYNCHRONIZE,
+            _WRITABLE_IDENTITY_ACCESS,
             _FILE_SHARE_READ | _FILE_SHARE_DELETE,
             _FILE_CREATE,
         )
