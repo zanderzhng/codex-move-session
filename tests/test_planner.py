@@ -2,7 +2,8 @@ import json
 import sqlite3
 from pathlib import Path
 
-from codex_move_session.planner import build_plan
+from codex_move_session.paths import PathMapper
+from codex_move_session.planner import _json_text_change, _plan_rollout, build_plan
 
 
 def create_codex_fixture(home: Path, old: Path, *, archived: bool = False) -> tuple[Path, Path]:
@@ -139,3 +140,26 @@ def test_plan_reports_unreadable_memory_database(tmp_path: Path) -> None:
     plan = build_plan(home, str(old), str(new))
 
     assert any("could not inspect memory database" in error for error in plan.errors)
+
+
+def test_windows_paths_are_matched_after_json_decoding(tmp_path: Path) -> None:
+    old = r"C:\Users\Alice\old-project"
+    new = r"D:\Work\new-project"
+    mapper = PathMapper(old, new, flavor="windows")
+    errors: list[str] = []
+
+    updated_text, count = _json_text_change(
+        json.dumps({"writable_roots": [old + r"\tmp"]}),
+        mapper,
+        location="sandbox_policy",
+        errors=errors,
+    )
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text(json.dumps({"payload": {"text": old + r"\src"}}) + "\n")
+    rollout_change = _plan_rollout(rollout, mapper, errors)
+
+    assert not errors
+    assert count == 1
+    assert new in json.loads(updated_text)["writable_roots"][0]
+    assert rollout_change is not None
+    assert new in json.loads(rollout_change.updated)["payload"]["text"]

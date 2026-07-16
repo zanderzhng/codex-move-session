@@ -16,6 +16,15 @@ class PathKeyCollisionError(ValueError):
     pass
 
 
+def _serialized_text_contains_path(value: str, mapper: PathMapper) -> bool:
+    if mapper.replace_text(value)[1]:
+        return True
+    encoded = json.dumps(mapper.old, ensure_ascii=False)[1:-1]
+    if mapper.flavor == "windows":
+        return encoded.casefold() in value.casefold()
+    return encoded in value
+
+
 @dataclass(frozen=True)
 class DatabaseChange:
     path: Path
@@ -93,12 +102,11 @@ def _replace_json(value: Any, mapper: PathMapper) -> tuple[Any, int]:
 def _json_text_change(
     value: str, mapper: PathMapper, *, location: str, errors: list[str]
 ) -> tuple[str, int]:
-    if mapper.replace_text(value)[1] == 0:
-        return value, 0
     try:
         parsed = json.loads(value)
     except json.JSONDecodeError as error:
-        errors.append(f"{location}: invalid JSON containing the old path: {error}")
+        if _serialized_text_contains_path(value, mapper):
+            errors.append(f"{location}: invalid JSON containing the old path: {error}")
         return value, 0
     try:
         updated, count = _replace_json(parsed, mapper)
@@ -131,13 +139,13 @@ def _plan_rollout(
             errors.append(f"{path}:{line_number}: rollout is not UTF-8: {error}")
             output.extend(raw_line)
             continue
-        if mapper.replace_text(text)[1] == 0:
-            output.extend(raw_line)
-            continue
         try:
             parsed = json.loads(text)
         except json.JSONDecodeError as error:
-            errors.append(f"{path}:{line_number}: invalid JSON containing the old path: {error}")
+            if _serialized_text_contains_path(text, mapper):
+                errors.append(
+                    f"{path}:{line_number}: invalid JSON containing the old path: {error}"
+                )
             output.extend(raw_line)
             continue
         try:

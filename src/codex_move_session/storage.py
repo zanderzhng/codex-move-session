@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import tempfile
 from collections.abc import Callable
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -108,7 +109,8 @@ def _read_database_value(db: sqlite3.Connection, change: DatabaseChange) -> Any:
 
 def _validate_unchanged(plan: MigrationPlan) -> None:
     for path, changes in _group_database_changes(plan.database_changes).items():
-        with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as db:
+        connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        with closing(connection) as db:
             for change in changes:
                 current = _read_database_value(db, change)
                 if current != change.original:
@@ -127,7 +129,10 @@ def _validate_unchanged(plan: MigrationPlan) -> None:
 
 
 def _backup_database(source_path: Path, backup_path: Path) -> None:
-    with sqlite3.connect(source_path) as source, sqlite3.connect(backup_path) as destination:
+    with (
+        closing(sqlite3.connect(source_path)) as source,
+        closing(sqlite3.connect(backup_path)) as destination,
+    ):
         source.backup(destination)
 
 
@@ -164,7 +169,7 @@ def _create_backup(plan: MigrationPlan) -> tuple[Path, dict[str, Any]]:
 
 
 def _apply_database_changes(path: Path, changes: list[DatabaseChange]) -> None:
-    with sqlite3.connect(path) as db:
+    with closing(sqlite3.connect(path)) as db:
         db.execute("BEGIN IMMEDIATE")
         try:
             for change in changes:
@@ -223,7 +228,8 @@ def _restore_backup(backup_dir: Path, manifest: dict[str, Any]) -> list[str]:
 
 def _verify_applied(plan: MigrationPlan) -> None:
     for path, changes in _group_database_changes(plan.database_changes).items():
-        with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as db:
+        connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        with closing(connection) as db:
             if db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
                 raise RuntimeError(f"SQLite quick_check failed: {path}")
             for change in changes:
