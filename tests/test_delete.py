@@ -366,10 +366,10 @@ def test_apply_deletion_rolls_back_when_file_remove_fails(
     original_global_state = fixture.global_state.read_bytes()
     plan = build_deletion_plan(fixture.home, "thread-1")
 
-    def fail_remove(path: Path, **_kwargs: object) -> None:
+    def fail_remove(*_args: object, **_kwargs: object) -> None:
         raise OSError("simulated remove failure")
 
-    monkeypatch.setattr(storage, "_remove_file", fail_remove)
+    monkeypatch.setattr(storage, "_remove_opened_file", fail_remove)
     with pytest.raises(ApplyError, match="restored"):
         apply_deletion(plan, process_checker=lambda: [])
 
@@ -837,16 +837,30 @@ def test_apply_deletion_rolls_back_when_post_replace_identity_check_fails(
     plan = build_deletion_plan(fixture.home, "thread-1")
     checks = 0
 
+    original_windows_replace = storage._atomic_replace_windows_file
+
     def fail_first_identity_check(*_args: object) -> None:
         nonlocal checks
         checks += 1
         if checks == 1:
             raise ConcurrentChangeError("simulated post-replace identity failure")
 
-    monkeypatch.setattr(
-        storage, "_verify_mutation_identity", fail_first_identity_check, raising=False
-    )
-    monkeypatch.setattr(storage, "_uses_windows_handle_delete", lambda: False)
+    def fail_after_first_windows_replace(*args: object, **kwargs: object) -> tuple[int, int]:
+        nonlocal checks
+        identity = original_windows_replace(*args, **kwargs)
+        checks += 1
+        if checks == 1:
+            raise ConcurrentChangeError("simulated post-replace identity failure")
+        return identity
+
+    if storage._uses_windows_handle_delete():
+        monkeypatch.setattr(
+            storage, "_atomic_replace_windows_file", fail_after_first_windows_replace
+        )
+    else:
+        monkeypatch.setattr(
+            storage, "_verify_mutation_identity", fail_first_identity_check, raising=False
+        )
 
     with pytest.raises(ApplyError, match="touched data restored"):
         apply_deletion(plan, process_checker=lambda: [])
