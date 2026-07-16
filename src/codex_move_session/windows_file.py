@@ -13,7 +13,7 @@ _WRITABLE_IDENTITY_ACCESS = _GENERIC_WRITE | _DELETE | _SYNCHRONIZE | _FILE_READ
 
 class _FileRenameInformation32(ctypes.Structure):
     _fields_ = [
-        ("replace_if_exists", ctypes.c_int32),
+        ("replace_if_exists", ctypes.c_ubyte),
         ("root_directory", ctypes.c_uint32),
         ("file_name_length", ctypes.c_uint32),
         ("file_name", ctypes.c_uint16 * 1),
@@ -22,7 +22,7 @@ class _FileRenameInformation32(ctypes.Structure):
 
 class _FileRenameInformation64(ctypes.Structure):
     _fields_ = [
-        ("replace_if_exists", ctypes.c_int32),
+        ("replace_if_exists", ctypes.c_ubyte),
         ("root_directory", ctypes.c_uint64),
         ("file_name_length", ctypes.c_uint32),
         ("file_name", ctypes.c_uint16 * 1),
@@ -33,6 +33,7 @@ _FILE_RENAME_INFORMATION_TYPES = {
     4: _FileRenameInformation32,
     8: _FileRenameInformation64,
 }
+_FILE_RENAME_INFORMATION_CLASS = 10
 
 
 def _rename_information_layout(pointer_size: int) -> tuple[int, int]:
@@ -44,6 +45,26 @@ def _build_rename_buffer(header_size: int, name_offset: int, encoded_name: bytes
     buffer = bytearray(max(header_size, name_offset) + len(encoded_name))
     buffer[name_offset : name_offset + len(encoded_name)] = encoded_name
     return buffer
+
+
+def _dispatch_rename_information(
+    handle: object,
+    io_status: object,
+    information: object,
+    length: int,
+    nt_set_information: object,
+    status_to_error: object,
+    error_factory: object,
+) -> None:
+    status = nt_set_information(
+        handle,
+        io_status,
+        information,
+        length,
+        _FILE_RENAME_INFORMATION_CLASS,
+    )
+    if status < 0:
+        raise error_factory(status_to_error(status))
 
 
 def _unsupported() -> OSError:
@@ -65,7 +86,6 @@ if os.name == "nt":
     _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
     _FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
     _FILE_DISPOSITION_INFO_CLASS = 4
-    _FILE_RENAME_INFO_CLASS = 3
     _FILE_CREATE = 2
     _FILE_OPEN = 1
     _FILE_NON_DIRECTORY_FILE = 0x00000040
@@ -161,6 +181,15 @@ if os.name == "nt":
         wintypes.DWORD,
     )
     _nt_create_file.restype = wintypes.LONG
+    _nt_set_information_file = _ntdll.NtSetInformationFile
+    _nt_set_information_file.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(_IoStatusBlock),
+        wintypes.LPVOID,
+        wintypes.ULONG,
+        ctypes.c_int,
+    )
+    _nt_set_information_file.restype = wintypes.LONG
     _rtl_nt_status_to_dos_error = _ntdll.RtlNtStatusToDosError
     _rtl_nt_status_to_dos_error.argtypes = (wintypes.LONG,)
     _rtl_nt_status_to_dos_error.restype = wintypes.ULONG
@@ -343,13 +372,16 @@ def _rename_handle(handle: int, parent_handle: int, name: str) -> None:
     information.replace_if_exists = True
     information.root_directory = parent_handle
     information.file_name_length = len(encoded_name)
-    if not _set_file_information(
+    io_status = _IoStatusBlock()
+    _dispatch_rename_information(
         wintypes.HANDLE(handle),
-        _FILE_RENAME_INFO_CLASS,
+        ctypes.byref(io_status),
         buffer,
         len(buffer),
-    ):
-        raise ctypes.WinError(ctypes.get_last_error())
+        _nt_set_information_file,
+        _rtl_nt_status_to_dos_error,
+        ctypes.WinError,
+    )
 
 
 def _open_file(path: Path, access: int, share: int, crt_flags: int) -> int:

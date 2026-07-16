@@ -179,6 +179,33 @@ def test_windows_rename_buffer_includes_native_layout(
     assert buffer[name_offset : name_offset + len(encoded_name)] == encoded_name
 
 
+def test_windows_rename_dispatch_uses_native_class_and_converts_failure() -> None:
+    calls: list[tuple[object, object, object, int, int]] = []
+
+    def nt_set_information(
+        handle: object,
+        io_status: object,
+        information: object,
+        length: int,
+        information_class: int,
+    ) -> int:
+        calls.append((handle, io_status, information, length, information_class))
+        return -1073741811
+
+    with pytest.raises(OSError, match="converted 5"):
+        windows_file._dispatch_rename_information(
+            "handle",
+            "io-status",
+            "buffer",
+            24,
+            nt_set_information,
+            lambda status: 5 if status == -1073741811 else 0,
+            lambda code: OSError(f"converted {code}"),
+        )
+
+    assert calls == [("handle", "io-status", "buffer", 24, 10)]
+
+
 def test_apply_deletion_removes_rows_and_file_and_keeps_backup(tmp_path: Path) -> None:
     fixture = create_delete_fixture(tmp_path)
     original_rollout = fixture.rollout.read_bytes()
