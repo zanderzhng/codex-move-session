@@ -494,6 +494,18 @@ def build_deletion_plan(home: Path, session_id: str) -> DeletionPlan:
             errors=tuple(errors),
         )
 
+    if session is None:
+        errors.append(f"could not discover metadata for session: {session_id}")
+        return DeletionPlan(
+            home=home,
+            session=None,
+            database_actions=tuple(database_actions),
+            file_deletions=(),
+            file_updates=(),
+            warnings=tuple(warnings),
+            errors=tuple(errors),
+        )
+
     rollout_paths: set[str] = set()
     for action in thread_actions:
         if "rollout_path" not in action.columns:

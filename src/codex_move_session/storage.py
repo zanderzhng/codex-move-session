@@ -479,8 +479,13 @@ def _create_deletion_backup(plan: DeletionPlan) -> tuple[Path, dict[str, Any]]:
     backup_dir = plan.home / "backups" / f"codex-move-session-{timestamp}"
     database_dir = backup_dir / "databases"
     file_dir = backup_dir / "files"
-    database_dir.mkdir(parents=True)
-    file_dir.mkdir()
+    try:
+        database_dir.mkdir(parents=True)
+        file_dir.mkdir()
+    except (OSError, RuntimeError) as error:
+        raise ApplyError(
+            f"could not create delete backup directory {backup_dir}: {error}", backup_dir
+        ) from error
     database_paths = sorted({action.path for action in plan.database_actions})
     file_paths = sorted(
         {item.path for item in plan.file_deletions} | {item.path for item in plan.file_updates}
@@ -494,14 +499,20 @@ def _create_deletion_backup(plan: DeletionPlan) -> tuple[Path, dict[str, Any]]:
     }
     for index, path in enumerate(database_paths):
         backup_path = database_dir / f"{index:03d}-{path.name}"
-        _backup_database(path, backup_path)
-        connection = sqlite3.connect(backup_path.resolve().as_uri() + "?mode=ro", uri=True)
-        with closing(connection) as db:
-            for action in (item for item in plan.database_actions if item.path == path):
-                if _read_action_rows(db, action) != action.original_rows:
-                    raise ConcurrentChangeError(
-                        f"database changed while creating delete backup: {path}:{action.table}"
-                    )
+        try:
+            _backup_database(path, backup_path)
+            connection = sqlite3.connect(backup_path.resolve().as_uri() + "?mode=ro", uri=True)
+            with closing(connection) as db:
+                for action in (item for item in plan.database_actions if item.path == path):
+                    if _read_action_rows(db, action) != action.original_rows:
+                        raise ConcurrentChangeError(
+                            f"database changed while creating delete backup: {path}:{action.table}"
+                        )
+        except (OSError, sqlite3.Error, RuntimeError) as error:
+            raise ApplyError(
+                f"could not create database backup for {path} at {backup_path}: {error}",
+                backup_dir,
+            ) from error
         manifest["databases"].append(
             {"original": str(path), "backup": str(backup_path.relative_to(backup_dir))}
         )
@@ -509,13 +520,25 @@ def _create_deletion_backup(plan: DeletionPlan) -> tuple[Path, dict[str, Any]]:
     originals.update({item.path: item.original for item in plan.file_updates})
     for index, path in enumerate(file_paths):
         backup_path = file_dir / f"{index:03d}-{path.name}.bin"
-        backup_path.write_bytes(originals[path])
+        try:
+            backup_path.write_bytes(originals[path])
+        except (OSError, RuntimeError) as error:
+            raise ApplyError(
+                f"could not create file backup for {path} at {backup_path}: {error}",
+                backup_dir,
+            ) from error
         manifest["files"].append(
             {"original": str(path), "backup": str(backup_path.relative_to(backup_dir))}
         )
-    (backup_dir / "manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    manifest_path = backup_dir / "manifest.json"
+    try:
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+    except (OSError, RuntimeError) as error:
+        raise ApplyError(
+            f"could not write delete backup manifest {manifest_path}: {error}", backup_dir
+        ) from error
     return backup_dir, manifest
 
 

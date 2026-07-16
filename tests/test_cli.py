@@ -175,6 +175,33 @@ def test_noninteractive_delete_apply_removes_session(tmp_path: Path) -> None:
     assert not rollout.exists()
 
 
+def test_noninteractive_delete_reports_backup_failure_without_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / ".codex"
+    old = tmp_path / "old-project"
+    create_codex_fixture(home, old)
+    console, recorder = recording_console()
+
+    def fail_database_backup(source: Path, _destination: Path) -> None:
+        raise sqlite3.OperationalError("simulated database backup failure")
+
+    monkeypatch.setattr("codex_move_session.storage._backup_database", fail_database_backup)
+
+    exit_code = run(
+        ["--delete", "thread-1", "--codex-home", str(home), "--apply"],
+        console=console,
+        process_checker=lambda: [],
+    )
+
+    output = recorder.export_text()
+    assert exit_code == 1
+    assert "Apply failed:" in output
+    assert "database backup" in output
+    assert "Backup:" in output
+    assert "Traceback" not in output
+
+
 def test_parser_rejects_delete_with_move_arguments(tmp_path: Path) -> None:
     with pytest.raises(SystemExit, match="2"):
         run(["--delete", "thread-1", "--old", "/old", "--new", "/new"])

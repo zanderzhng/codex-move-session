@@ -107,14 +107,60 @@ def test_plan_can_limit_move_to_one_session(tmp_path: Path) -> None:
     assert {change.key for change in plan.database_changes} == {"thread-1"}
     assert all(change.path != sibling_rollout for change in plan.file_changes)
     assert all(change.area != "cap_sid" for change in plan.file_changes)
-    global_change = next(
-        change for change in plan.file_changes if change.area == "global-state"
-    )
+    global_change = next(change for change in plan.file_changes if change.area == "global-state")
     updated = json.loads(global_change.updated)
     assert updated["thread-workspace-root-hints"]["thread-1"] == str(new)
     assert updated["thread-workspace-root-hints"]["thread-2"] == str(old)
     assert updated["electron-saved-workspace-roots"] == [str(old)]
     assert updated["project-order"] == [str(old)]
+
+
+def test_filtered_plan_blocks_rollout_shared_with_unselected_session(tmp_path: Path) -> None:
+    home = tmp_path / ".codex"
+    old = tmp_path / "old-project"
+    new = tmp_path / "new-project"
+    new.mkdir()
+    state, rollout = create_codex_fixture(home, old)
+    insert_sibling_session(home, state, old, thread_id="thread-2")
+    alias_parent = rollout.parent / "alias"
+    alias_parent.mkdir()
+    with sqlite3.connect(state) as db:
+        db.execute(
+            "UPDATE threads SET rollout_path = ? WHERE id = 'thread-2'",
+            (str(alias_parent / ".." / rollout.name),),
+        )
+
+    plan = build_plan(home, str(old), str(new), scope="all", session_id="thread-1")
+
+    assert any("rollout file is referenced by another session" in error for error in plan.errors)
+    assert all(change.path != rollout for change in plan.file_changes)
+
+
+def test_filtered_plan_withholds_rollout_rewrite_when_ownership_cannot_be_resolved(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = tmp_path / ".codex"
+    old = tmp_path / "old-project"
+    new = tmp_path / "new-project"
+    new.mkdir()
+    state, _ = create_codex_fixture(home, old)
+    sibling_rollout = insert_sibling_session(home, state, old, thread_id="thread-2")
+    original_resolve = Path.resolve
+
+    def fail_sibling_resolve(path: Path, *args: object, **kwargs: object) -> Path:
+        if path == sibling_rollout:
+            raise OSError("simulated resolution failure")
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", fail_sibling_resolve)
+
+    plan = build_plan(home, str(old), str(new), scope="all", session_id="thread-1")
+
+    assert any(
+        "could not resolve rollout path referenced by session thread-2" in error
+        for error in plan.errors
+    )
+    assert all(change.area != "rollout" for change in plan.file_changes)
 
 
 def test_filtered_plan_reports_global_hint_key_collision(tmp_path: Path) -> None:

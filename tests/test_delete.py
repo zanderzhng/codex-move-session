@@ -191,6 +191,79 @@ def test_apply_deletion_removes_rows_and_file_and_keeps_backup(tmp_path: Path) -
     assert memory_count(backup_databases[str(fixture.memories)], "thread-1") == 1
 
 
+def test_apply_deletion_reports_database_backup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    plan = build_deletion_plan(fixture.home, "thread-1")
+    failed_source: Path | None = None
+
+    def fail_database_backup(source: Path, _destination: Path) -> None:
+        nonlocal failed_source
+        failed_source = source
+        raise sqlite3.OperationalError("simulated database backup failure")
+
+    monkeypatch.setattr(storage, "_backup_database", fail_database_backup)
+
+    with pytest.raises(ApplyError) as raised:
+        apply_deletion(plan, process_checker=lambda: [])
+
+    assert failed_source is not None
+    assert str(failed_source) in str(raised.value)
+    assert "database backup" in str(raised.value)
+    assert raised.value.backup_dir.is_dir()
+    assert_delete_fixture_restored(fixture)
+    assert fixture.rollout.exists()
+
+
+def test_apply_deletion_reports_file_backup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    plan = build_deletion_plan(fixture.home, "thread-1")
+    original_write_bytes = Path.write_bytes
+
+    def fail_rollout_backup(path: Path, data: bytes) -> int:
+        if path.parent.name == "files" and path.name.endswith(f"{fixture.rollout.name}.bin"):
+            raise OSError("simulated file backup failure")
+        return original_write_bytes(path, data)
+
+    monkeypatch.setattr(Path, "write_bytes", fail_rollout_backup)
+
+    with pytest.raises(ApplyError) as raised:
+        apply_deletion(plan, process_checker=lambda: [])
+
+    assert str(fixture.rollout) in str(raised.value)
+    assert "file backup" in str(raised.value)
+    assert raised.value.backup_dir.is_dir()
+    assert_delete_fixture_restored(fixture)
+    assert fixture.rollout.exists()
+
+
+def test_apply_deletion_reports_manifest_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    plan = build_deletion_plan(fixture.home, "thread-1")
+    original_write_text = Path.write_text
+
+    def fail_manifest(path: Path, *args: object, **kwargs: object) -> int:
+        if path.name == "manifest.json" and path.parent.parent.name == "backups":
+            raise OSError("simulated manifest write failure")
+        return original_write_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_manifest)
+
+    with pytest.raises(ApplyError) as raised:
+        apply_deletion(plan, process_checker=lambda: [])
+
+    assert str(raised.value.backup_dir / "manifest.json") in str(raised.value)
+    assert "manifest" in str(raised.value)
+    assert raised.value.backup_dir.is_dir()
+    assert_delete_fixture_restored(fixture)
+    assert fixture.rollout.exists()
+
+
 def test_apply_deletion_refuses_concurrent_database_change(tmp_path: Path) -> None:
     fixture = create_delete_fixture(tmp_path)
     plan = build_deletion_plan(fixture.home, "thread-1")
@@ -1166,6 +1239,22 @@ def test_deletion_plan_requires_existing_thread(tmp_path: Path) -> None:
     assert plan.session is None
     assert any("not found" in error for error in plan.errors)
     assert not plan.database_actions
+    assert not plan.file_deletions
+    assert not plan.file_updates
+
+
+def test_deletion_plan_requires_discoverable_session_metadata(tmp_path: Path) -> None:
+    home = tmp_path / ".codex"
+    state = home / "sqlite" / "codex.db"
+    state.parent.mkdir(parents=True)
+    with sqlite3.connect(state) as db:
+        db.execute("CREATE TABLE threads (id TEXT PRIMARY KEY)")
+        db.execute("INSERT INTO threads VALUES ('thread-1')")
+
+    plan = build_deletion_plan(home, "thread-1")
+
+    assert plan.session is None
+    assert any("metadata" in error for error in plan.errors)
     assert not plan.file_deletions
     assert not plan.file_updates
 

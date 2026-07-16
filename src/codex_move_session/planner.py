@@ -118,9 +118,7 @@ def _json_text_change(
     return json.dumps(updated, ensure_ascii=False, separators=(",", ":")), count
 
 
-def _plan_rollout(
-    path: Path, mapper: PathMapper, errors: list[str]
-) -> FileChange | None:
+def _plan_rollout(path: Path, mapper: PathMapper, errors: list[str]) -> FileChange | None:
     original = path.read_bytes()
     output = bytearray()
     replacements = 0
@@ -309,6 +307,29 @@ def _plan_selected_thread_hint(
     )
 
 
+def _rollout_owners(
+    sessions: list[Session], errors: list[str]
+) -> tuple[dict[Path, set[str]], bool]:
+    owners: dict[Path, set[str]] = {}
+    complete = True
+    for session in sessions:
+        for record in session.records:
+            if not record.rollout_path:
+                continue
+            path = Path(record.rollout_path)
+            try:
+                resolved = path.resolve(strict=True)
+            except (OSError, RuntimeError) as error:
+                complete = False
+                errors.append(
+                    f"could not resolve rollout path referenced by session "
+                    f"{session.id}: {path}: {error}"
+                )
+                continue
+            owners.setdefault(resolved, set()).add(session.id)
+    return owners, complete
+
+
 def build_plan(
     home: Path,
     old: str,
@@ -328,7 +349,12 @@ def build_plan(
     rollout_paths: set[Path] = set()
 
     effective_scope: SessionScope = scope or ("all" if include_archived else "active")
-    for session in discover_sessions(home):
+    discovered_sessions = discover_sessions(home)
+    if session_id is not None:
+        rollout_owners, rollout_ownership_complete = _rollout_owners(discovered_sessions, errors)
+    else:
+        rollout_owners, rollout_ownership_complete = {}, True
+    for session in discovered_sessions:
         if session_id is not None and session.id != session_id:
             continue
         if effective_scope == "active" and session.archived:
@@ -378,9 +404,24 @@ def build_plan(
                 rollout_paths.add(Path(record.rollout_path))
 
     for path in sorted(rollout_paths):
+        if session_id is not None and not rollout_ownership_complete:
+            continue
         if not path.is_file():
             errors.append(f"rollout file not found: {path}")
             continue
+        if session_id is not None:
+            try:
+                owners = rollout_owners.get(path.resolve(strict=True), set())
+            except (OSError, RuntimeError) as error:
+                errors.append(f"could not resolve rollout path {path}: {error}")
+                continue
+            other_sessions = owners - {session_id}
+            if other_sessions:
+                errors.append(
+                    f"rollout file is referenced by another session "
+                    f"({', '.join(sorted(other_sessions))}): {path}"
+                )
+                continue
         change = _plan_rollout(path, mapper, errors)
         if change:
             file_changes.append(change)
@@ -410,9 +451,7 @@ def build_plan(
             file_changes.append(change)
     cap_sid = home / "cap_sid"
     if session_id is None and cap_sid.is_file():
-        change = _plan_json_file(
-            cap_sid, mapper, area="cap_sid", keys=None, errors=errors
-        )
+        change = _plan_json_file(cap_sid, mapper, area="cap_sid", keys=None, errors=errors)
         if change:
             file_changes.append(change)
 
