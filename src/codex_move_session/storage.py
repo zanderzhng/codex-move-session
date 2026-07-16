@@ -759,8 +759,6 @@ def _restore_deleted_file_exclusive(home: Path, item: FileDeletion) -> None:
             try:
                 _write_all(fd, item.original)
                 os.fsync(fd)
-                if hasattr(os, "fchmod"):
-                    os.fchmod(fd, item.original_mode)
             except BaseException:
                 _delete_windows_file(fd)
                 raise

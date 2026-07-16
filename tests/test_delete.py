@@ -1113,6 +1113,46 @@ def test_windows_restore_write_failure_removes_owned_partial_file(
     assert not deletion.path.exists()
 
 
+def test_windows_restore_skips_fchmod_and_closes_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    plan = build_deletion_plan(fixture.home, "thread-1")
+    deletion = plan.file_deletions[0]
+    deletion.path.unlink()
+    created_fd = -1
+    fsync_calls: list[int] = []
+    original_fsync = os.fsync
+
+    def native_create(parent: Path, name: str, _identity: tuple[int, int]) -> int:
+        nonlocal created_fd
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+        created_fd = os.open(parent / name, flags, 0o600)
+        return created_fd
+
+    def record_fsync(fd: int) -> None:
+        fsync_calls.append(fd)
+        original_fsync(fd)
+
+    def fail_fchmod(_fd: int, _mode: int) -> None:
+        raise AssertionError("native Windows restore must not call fchmod")
+
+    monkeypatch.setattr(storage, "_supports_secure_dir_fd", lambda: False)
+    monkeypatch.setattr(storage, "_uses_windows_handle_delete", lambda: True)
+    monkeypatch.setattr(storage, "_get_windows_file_identity", lambda _path: (1, 2), raising=False)
+    monkeypatch.setattr(storage, "_create_windows_file_exclusive", native_create, raising=False)
+    monkeypatch.setattr(storage, "_delete_windows_file", lambda _fd: deletion.path.unlink())
+    monkeypatch.setattr(storage.os, "fsync", record_fsync)
+    monkeypatch.setattr(storage.os, "fchmod", fail_fchmod, raising=False)
+
+    storage._restore_deleted_file_exclusive(plan.home, deletion)
+
+    assert deletion.path.read_bytes() == deletion.original
+    assert fsync_calls == [created_fd]
+    with pytest.raises(OSError):
+        os.fstat(created_fd)
+
+
 def test_apply_deletion_rolls_back_when_database_apply_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
