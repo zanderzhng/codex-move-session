@@ -1,9 +1,12 @@
 import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
 from rich.console import Console
 from test_apply import read_thread_cwd
-from test_planner import create_codex_fixture
+from test_delete import thread_count
+from test_planner import create_codex_fixture, insert_sibling_session
 
 from codex_move_session.cli import PromptAdapter, run
 
@@ -14,10 +17,20 @@ def recording_console() -> tuple[Console, object]:
 
 
 class FakePrompts(PromptAdapter):
-    def __init__(self, old: str, new: str, *, confirm: bool) -> None:
-        self.old = old
-        self.new = new
+    def __init__(
+        self,
+        old: str | Path,
+        new: str | Path,
+        *,
+        confirm: bool,
+        session_id: str = "thread-1",
+        action: str = "move",
+    ) -> None:
+        self.old = str(old)
+        self.new = str(new)
         self.confirmed = confirm
+        self.session_id = session_id
+        self.action = action
 
     def choose_scope(self) -> str | None:
         return "all"
@@ -28,8 +41,40 @@ class FakePrompts(PromptAdapter):
     def choose_new(self, old: str) -> str | None:
         return self.new
 
+    def choose_session(self, group: object) -> str | None:
+        return self.session_id
+
+    def choose_action(self) -> str | None:
+        return self.action
+
     def confirm_apply(self) -> bool:
         return self.confirmed
+
+    def confirm_delete(self, session: object) -> bool:
+        return self.confirmed
+
+
+@dataclass(frozen=True)
+class TwoSessionCliFixture:
+    home: Path
+    old: Path
+    new: Path
+    state: Path
+
+
+def create_two_session_cli_fixture(tmp_path: Path) -> TwoSessionCliFixture:
+    home = tmp_path / ".codex"
+    old = tmp_path / "old-project"
+    new = tmp_path / "new-project"
+    new.mkdir()
+    state, _ = create_codex_fixture(home, old)
+    insert_sibling_session(home, state, old, thread_id="thread-2")
+    return TwoSessionCliFixture(home, old, new, state)
+
+
+def thread_cwd(path: Path, thread_id: str) -> str:
+    with sqlite3.connect(path) as db:
+        return db.execute("SELECT cwd FROM threads WHERE id = ?", (thread_id,)).fetchone()[0]
 
 
 def test_noninteractive_is_dry_run_and_describes_changes(tmp_path: Path) -> None:
@@ -80,6 +125,41 @@ def test_noninteractive_apply_updates_data(tmp_path: Path) -> None:
     assert read_thread_cwd(state) == str(new)
 
 
+def test_noninteractive_delete_is_dry_run(tmp_path: Path) -> None:
+    home = tmp_path / ".codex"
+    old = tmp_path / "old-project"
+    state, rollout = create_codex_fixture(home, old)
+    console, recorder = recording_console()
+
+    exit_code = run(["--delete", "thread-1", "--codex-home", str(home)], console=console)
+
+    assert exit_code == 0
+    assert "Delete dry run" in recorder.export_text()
+    assert read_thread_cwd(state) == str(old)
+    assert rollout.exists()
+
+
+def test_noninteractive_delete_apply_removes_session(tmp_path: Path) -> None:
+    home = tmp_path / ".codex"
+    old = tmp_path / "old-project"
+    state, rollout = create_codex_fixture(home, old)
+
+    exit_code = run(
+        ["--delete", "thread-1", "--codex-home", str(home), "--apply"],
+        console=recording_console()[0],
+        process_checker=lambda: [],
+    )
+
+    assert exit_code == 0
+    assert thread_count(state, "thread-1") == 0
+    assert not rollout.exists()
+
+
+def test_parser_rejects_delete_with_move_arguments(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit, match="2"):
+        run(["--delete", "thread-1", "--old", "/old", "--new", "/new"])
+
+
 def test_interactive_selects_stale_path_previews_and_confirms_apply(tmp_path: Path) -> None:
     home = tmp_path / ".codex"
     old = tmp_path / "old-project"
@@ -118,3 +198,47 @@ def test_interactive_cancel_leaves_data_unchanged(tmp_path: Path) -> None:
     assert exit_code == 0
     with sqlite3.connect(state) as db:
         assert db.execute("SELECT cwd FROM threads").fetchone()[0] == str(old)
+
+
+def test_interactive_can_delete_one_selected_session(tmp_path: Path) -> None:
+    fixture = create_two_session_cli_fixture(tmp_path)
+    prompts = FakePrompts(
+        fixture.old,
+        fixture.new,
+        confirm=True,
+        session_id="thread-1",
+        action="delete",
+    )
+
+    exit_code = run(
+        ["--codex-home", str(fixture.home)],
+        console=recording_console()[0],
+        prompts=prompts,
+        process_checker=lambda: [],
+    )
+
+    assert exit_code == 0
+    assert thread_count(fixture.state, "thread-1") == 0
+    assert thread_count(fixture.state, "thread-2") == 1
+
+
+def test_interactive_move_changes_only_selected_session(tmp_path: Path) -> None:
+    fixture = create_two_session_cli_fixture(tmp_path)
+    prompts = FakePrompts(
+        fixture.old,
+        fixture.new,
+        confirm=True,
+        session_id="thread-1",
+        action="move",
+    )
+
+    exit_code = run(
+        ["--codex-home", str(fixture.home)],
+        console=recording_console()[0],
+        prompts=prompts,
+        process_checker=lambda: [],
+    )
+
+    assert exit_code == 0
+    assert thread_cwd(fixture.state, "thread-1") == str(fixture.new)
+    assert thread_cwd(fixture.state, "thread-2") == str(fixture.old)
