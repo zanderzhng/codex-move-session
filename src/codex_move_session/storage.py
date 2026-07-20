@@ -137,7 +137,7 @@ def _planned_relative_parts(home: Path, path: Path, *, rollout: bool) -> tuple[s
     if rollout:
         if len(parts) < 2 or parts[0] not in {"sessions", "archived_sessions"}:
             raise ConcurrentChangeError(f"rollout moved outside session directories: {path}")
-    elif parts != (".codex-global-state.json",):
+    elif parts not in {(".codex-global-state.json",), ("session_index.jsonl",)}:
         raise ConcurrentChangeError(f"unexpected deletion file update path: {path}")
     if any(part in {"", ".", ".."} for part in parts):
         raise ConcurrentChangeError(f"unsafe file path: {path}")
@@ -272,6 +272,10 @@ def _validate_unchanged(plan: MigrationPlan) -> None:
                         f"{change.column}[{change.key}]"
                     )
     for change in plan.file_changes:
+        if change.created:
+            if change.path.exists():
+                raise ConcurrentChangeError(f"file appeared after preview: {change.path}")
+            continue
         try:
             current = change.path.read_bytes()
         except OSError as error:
@@ -423,6 +427,15 @@ def _validate_deletion_unchanged(plan: DeletionPlan) -> dict[Path, tuple[int, in
                     raise ConcurrentChangeError(
                         f"database changed after delete preview: {path}:{action.table}"
                     )
+    for path, changes in _group_database_changes(plan.database_changes).items():
+        connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        with closing(connection) as db:
+            for change in changes:
+                if _read_database_value(db, change) != change.original:
+                    raise ConcurrentChangeError(
+                        f"database changed after delete preview: {path}:{change.table}."
+                        f"{change.column}[{change.key}]"
+                    )
     for item in plan.file_deletions:
         opened = _open_planned_file(plan.home, item.path, item.original, deletion=item)
         identities[item.path] = (opened.device, opened.inode)
@@ -466,7 +479,12 @@ def _create_backup(plan: MigrationPlan) -> tuple[Path, dict[str, Any]]:
         backup_path = file_dir / f"{index:03d}-{change.path.name}.bin"
         backup_path.write_bytes(change.original)
         manifest["files"].append(
-            {"original": str(change.path), "backup": str(backup_path.relative_to(backup_dir))}
+            {
+                "original": str(change.path),
+                "backup": str(backup_path.relative_to(backup_dir)),
+                "created": change.created,
+                "updated_digest": hashlib.sha256(change.updated).hexdigest(),
+            }
         )
     (backup_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -486,7 +504,10 @@ def _create_deletion_backup(plan: DeletionPlan) -> tuple[Path, dict[str, Any]]:
         raise ApplyError(
             f"could not create delete backup directory {backup_dir}: {error}", backup_dir
         ) from error
-    database_paths = sorted({action.path for action in plan.database_actions})
+    database_paths = sorted(
+        {action.path for action in plan.database_actions}
+        | {change.path for change in plan.database_changes}
+    )
     file_paths = sorted(
         {item.path for item in plan.file_deletions} | {item.path for item in plan.file_updates}
     )
@@ -507,6 +528,12 @@ def _create_deletion_backup(plan: DeletionPlan) -> tuple[Path, dict[str, Any]]:
                     if _read_action_rows(db, action) != action.original_rows:
                         raise ConcurrentChangeError(
                             f"database changed while creating delete backup: {path}:{action.table}"
+                        )
+                for change in (item for item in plan.database_changes if item.path == path):
+                    if _read_database_value(db, change) != change.original:
+                        raise ConcurrentChangeError(
+                            f"database changed while creating delete backup: {path}:"
+                            f"{change.table}.{change.column}"
                         )
         except (OSError, sqlite3.Error, RuntimeError) as error:
             raise ApplyError(
@@ -799,6 +826,7 @@ def _open_deletion_transactions(
     errors: list[str] = []
     paths = set(_database_paths(plan.home, errors))
     paths.update(action.path for action in plan.database_actions)
+    paths.update(change.path for change in plan.database_changes)
     if errors:
         raise ConcurrentChangeError("could not lock deletion databases: " + "; ".join(errors))
     databases: dict[Path, sqlite3.Connection] = {}
@@ -875,6 +903,33 @@ def _restore_committed_actions(path: Path, actions: list[DatabaseAction]) -> str
     return None
 
 
+def _restore_committed_changes(path: Path, changes: list[DatabaseChange]) -> str | None:
+    try:
+        with closing(sqlite3.connect(path)) as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                for change in reversed(changes):
+                    table = _quote_identifier(change.table)
+                    column = _quote_identifier(change.column)
+                    key_column = _quote_identifier(change.key_column)
+                    cursor = db.execute(
+                        f"UPDATE {table} SET {column} = ? "
+                        f"WHERE {key_column} = ? AND {column} IS ?",
+                        (change.original, change.key, change.updated),
+                    )
+                    if cursor.rowcount != 1:
+                        raise ConcurrentChangeError(
+                            f"updated row changed concurrently: {path}:{change.table}"
+                        )
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+    except (OSError, sqlite3.Error, RuntimeError) as error:
+        return f"{path}: {error}"
+    return None
+
+
 def _restore_copy(source: Path, destination: Path) -> None:
     fd, temporary_name = tempfile.mkstemp(
         prefix=f".{destination.name}.restore.", dir=destination.parent
@@ -911,8 +966,17 @@ def _restore_backup(backup_dir: Path, manifest: dict[str, Any]) -> list[str]:
         destination = Path(entry["original"])
         source = backup_dir / entry["backup"]
         try:
-            _restore_copy(source, destination)
-        except OSError as error:
+            if entry.get("created"):
+                if destination.exists():
+                    current_digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+                    if current_digest != entry.get("updated_digest"):
+                        raise RuntimeError(
+                            f"created file changed before rollback: {destination}"
+                        )
+                    destination.unlink()
+            else:
+                _restore_copy(source, destination)
+        except (OSError, RuntimeError) as error:
             errors.append(f"{destination}: {error}")
     return errors
 
@@ -939,6 +1003,21 @@ def _verify_deletion(
     databases: dict[Path, sqlite3.Connection] | None = None,
     mutated_identities: dict[Path, tuple[int, int]] | None = None,
 ) -> None:
+    for path, changes in _group_database_changes(plan.database_changes).items():
+        if databases is None:
+            connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+            manager = closing(connection)
+        else:
+            manager = nullcontext(databases[path])
+        with manager as db:
+            if db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                raise RuntimeError(f"SQLite quick_check failed: {path}")
+            for change in changes:
+                if _read_database_value(db, change) != change.updated:
+                    raise RuntimeError(
+                        f"database update verification failed: {path}:{change.table}."
+                        f"{change.column}[{change.key}]"
+                    )
     for path, actions in _group_deletion_actions(plan.database_actions).items():
         if databases is None:
             connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
@@ -990,10 +1069,14 @@ def apply_plan(
     plan: MigrationPlan,
     *,
     process_checker: Callable[[], list[str]] = running_codex_processes,
+    create_destination: bool = False,
 ) -> ApplyResult:
     if plan.errors:
         raise PlanValidationError("migration plan contains errors: " + "; ".join(plan.errors))
-    if not Path(plan.new).is_dir():
+    destination = Path(plan.new)
+    if destination.exists() and not destination.is_dir():
+        raise PlanValidationError(f"destination is not a directory: {plan.new}")
+    if not destination.is_dir() and not create_destination:
         raise PlanValidationError(f"destination directory does not exist: {plan.new}")
     running = process_checker()
     if running:
@@ -1001,7 +1084,17 @@ def apply_plan(
     if not plan.has_changes:
         return ApplyResult(backup_dir=None, database_changes=0, file_changes=0)
     _validate_unchanged(plan)
-    backup_dir, manifest = _create_backup(plan)
+    created_destination = False
+    if not destination.is_dir():
+        destination.mkdir(parents=True)
+        created_destination = True
+    try:
+        backup_dir, manifest = _create_backup(plan)
+    except BaseException:
+        if created_destination:
+            with suppress(OSError):
+                destination.rmdir()
+        raise
     try:
         for path, changes in _group_database_changes(plan.database_changes).items():
             _apply_database_changes(path, changes)
@@ -1010,6 +1103,9 @@ def apply_plan(
         _verify_applied(plan)
     except BaseException as error:
         restore_errors = _restore_backup(backup_dir, manifest)
+        if created_destination:
+            with suppress(OSError):
+                destination.rmdir()
         if restore_errors:
             detail = "; ".join(restore_errors)
             raise ApplyError(
@@ -1082,6 +1178,22 @@ def apply_deletion(
         running = process_checker()
         if running:
             raise ProcessRunningError("Close Codex before applying changes: " + ", ".join(running))
+        for path, changes in _group_database_changes(plan.database_changes).items():
+            db = databases[path]
+            for change in changes:
+                table = _quote_identifier(change.table)
+                column = _quote_identifier(change.column)
+                key_column = _quote_identifier(change.key_column)
+                cursor = db.execute(
+                    f"UPDATE {table} SET {column} = ? "
+                    f"WHERE {key_column} = ? AND {column} IS ?",
+                    (change.updated, change.key, change.original),
+                )
+                if cursor.rowcount != 1:
+                    raise ConcurrentChangeError(
+                        f"database changed during delete: {path}:{change.table}."
+                        f"{change.column}[{change.key}]"
+                    )
         for path, actions in _group_deletion_actions(plan.database_actions).items():
             _apply_deletion_actions(databases[path], path, actions)
         for item in plan.file_updates:
@@ -1149,8 +1261,12 @@ def apply_deletion(
                     db.rollback()
         restore_errors = _restore_deletion_files(plan, mutation_journal)
         grouped = _group_deletion_actions(plan.database_actions)
+        grouped_changes = _group_database_changes(plan.database_changes)
         for path in reversed(committed):
             restore_error = _restore_committed_actions(path, grouped.get(path, []))
+            if restore_error is not None:
+                restore_errors.append(restore_error)
+            restore_error = _restore_committed_changes(path, grouped_changes.get(path, []))
             if restore_error is not None:
                 restore_errors.append(restore_error)
         if restore_errors:

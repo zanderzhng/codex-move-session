@@ -1421,6 +1421,88 @@ def test_deletion_plan_requires_discoverable_session_metadata(tmp_path: Path) ->
     assert not plan.file_updates
 
 
+def test_delete_cleans_index_sidebar_and_last_workspace(tmp_path: Path) -> None:
+    fixture = create_delete_fixture(tmp_path)
+    project = tmp_path / "missing"
+    index = fixture.home / "session_index.jsonl"
+    index.write_text(
+        '{"id":"thread-1","thread_name":"Delete me"}\n'
+        '{"id":"thread-2","thread_name":"Keep me"}\n'
+    )
+    state = json.loads(fixture.global_state.read_text())
+    state.update(
+        {
+            "pinned-thread-ids": ["thread-1", "thread-2"],
+            "sidebar-project-thread-orders": {
+                str(project): {"threadIds": ["thread-1"]}
+            },
+            "electron-saved-workspace-roots": [str(project)],
+            "active-workspace-roots": [str(project)],
+            "project-order": [str(project)],
+            "electron-workspace-root-labels": {str(project): "Project"},
+            "electron-persisted-atom-state": {
+                "sidebar-collapsed-groups": {str(project): True}
+            },
+        }
+    )
+    fixture.global_state.write_text(json.dumps(state))
+
+    plan = build_deletion_plan(fixture.home, "thread-1")
+    apply_deletion(plan, process_checker=lambda: [])
+
+    assert "thread-1" not in index.read_text()
+    assert "thread-2" in index.read_text()
+    updated = json.loads(fixture.global_state.read_text())
+    assert updated["pinned-thread-ids"] == ["thread-2"]
+    assert str(project) not in updated["sidebar-project-thread-orders"]
+    assert str(project) not in updated["electron-saved-workspace-roots"]
+    assert str(project) not in updated["electron-workspace-root-labels"]
+
+
+def test_delete_archived_copy_redirects_thread_to_active_copy(tmp_path: Path) -> None:
+    home = tmp_path / ".codex"
+    project = tmp_path / "project"
+    active = home / "sessions" / "rollout-thread-1.jsonl"
+    archived = home / "archived_sessions" / "rollout-thread-1.jsonl"
+    active.parent.mkdir(parents=True)
+    archived.parent.mkdir(parents=True)
+    line = json.dumps(
+        {"type": "session_meta", "payload": {"id": "thread-1", "cwd": str(project)}}
+    )
+    active.write_text(line + "\n")
+    archived.write_text(line + "\n")
+    state = home / "state_5.sqlite"
+    with sqlite3.connect(state) as db:
+        db.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, cwd TEXT, "
+            "archived INTEGER, archived_at INTEGER, updated_at_ms INTEGER, rollout_path TEXT)"
+        )
+        db.execute(
+            "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("thread-1", "Title", str(project), 1, 123, 100, str(archived)),
+        )
+    index = home / "session_index.jsonl"
+    index.write_text('{"id":"thread-1","thread_name":"Title"}\n')
+
+    plan = build_deletion_plan(home, "thread-1", scope="archived")
+    assert not plan.database_actions
+    assert {change.column for change in plan.database_changes} == {
+        "rollout_path",
+        "archived",
+        "archived_at",
+    }
+    apply_deletion(plan, process_checker=lambda: [])
+
+    assert active.exists()
+    assert not archived.exists()
+    assert "thread-1" in index.read_text()
+    with sqlite3.connect(state) as db:
+        row = db.execute(
+            "SELECT rollout_path, archived, archived_at FROM threads WHERE id='thread-1'"
+        ).fetchone()
+    assert row == (str(active), 0, None)
+
+
 def test_deletion_plan_reports_database_and_global_state_read_errors(tmp_path: Path) -> None:
     fixture = create_delete_fixture(tmp_path)
     (fixture.home / "memories_2.sqlite").write_text("not sqlite")

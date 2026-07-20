@@ -62,3 +62,21 @@ def test_stale_groups_filter_active_archived_or_all(tmp_path: Path) -> None:
     assert [group.count for group in stale_groups(sessions, scope="active")] == [1]
     assert [group.count for group in stale_groups(sessions, scope="archived")] == [1]
     assert [group.count for group in stale_groups(sessions, scope="all")] == [2]
+
+
+def test_discovery_includes_rollout_without_database_and_recovers_title(tmp_path: Path) -> None:
+    home = tmp_path / ".codex"
+    rollout = home / "sessions" / "2026" / "rollout-thread-orphan.jsonl"
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text(
+        '{"type":"session_meta","payload":{"id":"thread-orphan","cwd":"/moved"}}\n'
+        '{"type":"response_item","payload":{"text":"Recovered title"}}\n'
+    )
+
+    session = discover_sessions(home)[0]
+
+    assert session.id == "thread-orphan"
+    assert session.title == "Recovered title"
+    assert session.records == ()
+    assert session.rollouts[0].path == rollout
+    assert session.issues == ("rollout_without_database",)

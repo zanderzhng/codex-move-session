@@ -66,6 +66,23 @@ After reviewing the deletion plan, apply it explicitly:
 codex-move-session --delete SESSION_ID --apply
 ```
 
+Delete every session whose working directory is a project or one of its descendants:
+
+```console
+codex-move-session --delete-project /previous/project
+codex-move-session --delete-project /previous/project --apply
+```
+
+Limit deletion to one stored copy when an ID exists in both active and archived storage:
+
+```console
+codex-move-session --delete SESSION_ID --delete-scope archived
+```
+
+The remaining copy is preserved, and its database row is redirected to the surviving rollout.
+Project-wide apply creates and verifies a separate backup for each session and stops at the first
+failure.
+
 Deletion removes the local session and related database rows, related memory, and its rollout file
 after creating a backup. It never deletes project files.
 
@@ -81,6 +98,28 @@ codex-move-session \
 
 `CODEX_HOME` is respected when `--codex-home` is not given.
 
+Inspect inconsistencies between rollout files, databases, and `session_index.jsonl`:
+
+```console
+codex-move-session --doctor
+codex-move-session --doctor --repair
+codex-move-session --doctor --repair --apply
+```
+
+Doctor reports orphaned or missing rollout files and duplicate copies. Safe repairs redirect stale
+`threads.rollout_path` values, align archived state, recover blank titles, and create or supplement
+`session_index.jsonl`. It does not synthesize an entire database row for an orphaned rollout.
+
+To create a missing destination as part of an applied migration:
+
+```console
+codex-move-session \
+  --old /previous/project \
+  --new /current/project \
+  --create-new \
+  --apply
+```
+
 ## What Changes
 
 The migration is driven by sessions whose `cwd` equals the old directory or is below it. It can
@@ -92,9 +131,10 @@ update:
   including metadata, messages, commands, tool calls, and tool output.
 - `raw_memory` and `rollout_summary` for affected thread IDs in Codex memory databases.
 - Known workspace roots and thread hints in `.codex-global-state.json` and `cap_sid`.
+- Desktop sidebar project ordering, collapsed workspace groups, and workspace labels.
 
-It does not move project files. The destination must already exist before apply. Prompt history,
-logs, caches, and previous backups are not rewritten.
+It does not move project files. The destination must already exist before apply unless
+`--create-new` is provided. Prompt history, logs, caches, and previous backups are not rewritten.
 
 Windows paths use case-insensitive matching and support drive, UNC, extended, and mixed-separator
 forms. macOS and Linux matching is case-sensitive. Similar names such as `/project-copy` are not
@@ -114,11 +154,17 @@ Dry-run is always the default. Apply mode:
 Each backup contains `manifest.json`, standalone SQLite snapshots, and the original content of every
 changed file. Backups can contain private conversations and local paths; do not publish them.
 
-Session deletion uses the same safeguards. `--delete` is a dry-run unless `--apply` is present, and
+Session discovery combines compatible SQLite databases with active and archived rollout files. This
+exposes rollout-only sessions and recovers missing titles from `session_index.jsonl`, rollout content,
+or `history.jsonl`.
+
+Session deletion uses the same safeguards. `--delete` and `--delete-project` are dry-runs unless
+`--apply` is present, and
 apply refuses to proceed while Codex is running or if the planned database rows or files changed
 after the preview. It also rechecks the database set and refuses to delete a rollout shared by
 another session. Before deletion, it backs up the affected databases, rollout file, and other changed
-Codex state. After writing, it verifies database integrity, confirms the planned rows and rollout
+Codex state. It also removes the session index entry, thread pins and sidebar ordering when no stored
+copy remains. After writing, it verifies database integrity, confirms the planned rows and rollout
 file are gone, and checks the remaining file updates. If deletion or verification fails, open
 transactions, captured original file content, and scoped original-row restoration automatically
 roll back the touched session data. The retained backup remains available for audit or recovery, and

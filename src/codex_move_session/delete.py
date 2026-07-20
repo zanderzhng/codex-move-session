@@ -8,8 +8,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from .discovery import Session, candidate_session_databases, discover_sessions
-from .planner import FileChange
+from .discovery import Session, SessionScope, candidate_session_databases, discover_sessions
+from .planner import DatabaseChange, FileChange
+from .session_files import RolloutRecord
 from .sqlite_read import open_sqlite_snapshot
 
 DatabaseActionKind = Literal["delete", "clear"]
@@ -45,6 +46,7 @@ class FileDeletion:
 class DeletionPlan:
     home: Path
     session: Session | None
+    database_changes: tuple[DatabaseChange, ...]
     database_actions: tuple[DatabaseAction, ...]
     file_deletions: tuple[FileDeletion, ...]
     file_updates: tuple[FileChange, ...]
@@ -53,7 +55,12 @@ class DeletionPlan:
 
     @property
     def has_changes(self) -> bool:
-        return bool(self.database_actions or self.file_deletions or self.file_updates)
+        return bool(
+            self.database_changes
+            or self.database_actions
+            or self.file_deletions
+            or self.file_updates
+        )
 
     @property
     def deleted_rows(self) -> int:
@@ -395,7 +402,14 @@ def _plan_rollout_deletions(
     return deletions
 
 
-def _plan_global_state(home: Path, session_id: str, errors: list[str]) -> FileChange | None:
+def _plan_global_state(
+    home: Path,
+    session_id: str,
+    errors: list[str],
+    *,
+    cwd: str = "",
+    remove_workspace: bool = False,
+) -> FileChange | None:
     path = home / ".codex-global-state.json"
     try:
         info = path.lstat()
@@ -422,18 +436,67 @@ def _plan_global_state(home: Path, session_id: str, errors: list[str]) -> FileCh
     if not isinstance(parsed, dict):
         errors.append(f"{path}: expected a JSON object")
         return None
-    hints = parsed.get("thread-workspace-root-hints")
-    if hints is None:
-        return None
-    if not isinstance(hints, dict):
+    updated = dict(parsed)
+    replacements = 0
+    hints = updated.get("thread-workspace-root-hints")
+    if hints is not None and not isinstance(hints, dict):
         errors.append(f"{path}: expected thread-workspace-root-hints to be a JSON object")
         return None
-    if session_id not in hints:
+    if isinstance(hints, dict) and session_id in hints:
+        updated_hints = dict(hints)
+        del updated_hints[session_id]
+        updated["thread-workspace-root-hints"] = updated_hints
+        replacements += 1
+    pinned = updated.get("pinned-thread-ids")
+    if isinstance(pinned, list):
+        filtered = [item for item in pinned if item != session_id]
+        replacements += len(pinned) - len(filtered)
+        updated["pinned-thread-ids"] = filtered
+    orders = updated.get("sidebar-project-thread-orders")
+    if isinstance(orders, dict):
+        next_orders = dict(orders)
+        for workspace, raw_order in orders.items():
+            if not isinstance(raw_order, dict) or not isinstance(raw_order.get("threadIds"), list):
+                continue
+            thread_ids = raw_order["threadIds"]
+            filtered = [item for item in thread_ids if item != session_id]
+            if filtered != thread_ids:
+                next_order = dict(raw_order)
+                next_order["threadIds"] = filtered
+                next_orders[workspace] = next_order
+                replacements += len(thread_ids) - len(filtered)
+                if remove_workspace and workspace == cwd and not filtered:
+                    del next_orders[workspace]
+        updated["sidebar-project-thread-orders"] = next_orders
+    if remove_workspace and cwd:
+        for key in (
+            "electron-saved-workspace-roots",
+            "active-workspace-roots",
+            "project-order",
+        ):
+            values = updated.get(key)
+            if isinstance(values, list):
+                filtered = [item for item in values if item != cwd]
+                replacements += len(values) - len(filtered)
+                updated[key] = filtered
+        labels = updated.get("electron-workspace-root-labels")
+        if isinstance(labels, dict) and cwd in labels:
+            next_labels = dict(labels)
+            del next_labels[cwd]
+            updated["electron-workspace-root-labels"] = next_labels
+            replacements += 1
+        persisted = updated.get("electron-persisted-atom-state")
+        if isinstance(persisted, dict):
+            groups = persisted.get("sidebar-collapsed-groups")
+            if isinstance(groups, dict) and cwd in groups:
+                next_persisted = dict(persisted)
+                next_groups = dict(groups)
+                del next_groups[cwd]
+                next_persisted["sidebar-collapsed-groups"] = next_groups
+                updated["electron-persisted-atom-state"] = next_persisted
+                replacements += 1
+    if not replacements:
         return None
-    updated = dict(parsed)
-    updated_hints = dict(hints)
-    del updated_hints[session_id]
-    updated["thread-workspace-root-hints"] = updated_hints
     output = json.dumps(updated, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
     return FileChange(
         path=path,
@@ -441,12 +504,112 @@ def _plan_global_state(home: Path, session_id: str, errors: list[str]) -> FileCh
         original=original,
         updated=output,
         original_digest=hashlib.sha256(original).hexdigest(),
-        replacements=1,
+        replacements=replacements,
     )
 
 
-def build_deletion_plan(home: Path, session_id: str) -> DeletionPlan:
+def _plan_session_index(home: Path, session_id: str, errors: list[str]) -> FileChange | None:
+    path = home / "session_index.jsonl"
+    if not path.is_file():
+        return None
+    try:
+        original = path.read_bytes()
+        text = original.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        errors.append(f"could not read session index {path}: {error}")
+        return None
+    kept: list[str] = []
+    removed = 0
+    for raw in text.splitlines(keepends=True):
+        body = raw.rstrip("\r\n")
+        try:
+            item = json.loads(body)
+        except json.JSONDecodeError:
+            kept.append(raw)
+            continue
+        if not isinstance(item, dict):
+            kept.append(raw)
+            continue
+        if item.get("id") == session_id or item.get("session_id") == session_id:
+            removed += 1
+        else:
+            kept.append(raw)
+    if not removed:
+        return None
+    return FileChange(
+        path=path,
+        area="session-index-delete",
+        original=original,
+        updated="".join(kept).encode(),
+        original_digest=hashlib.sha256(original).hexdigest(),
+        replacements=removed,
+    )
+
+
+def _selected_rollouts(
+    session: Session, scope: SessionScope
+) -> tuple[set[str], tuple[RolloutRecord, ...]]:
+    selected = tuple(
+        rollout
+        for rollout in session.rollouts
+        if scope == "all"
+        or (scope == "active" and not rollout.archived)
+        or (scope == "archived" and rollout.archived)
+    )
+    paths = {str(rollout.path) for rollout in selected}
+    if not paths and scope == "all":
+        paths.update(record.rollout_path for record in session.records if record.rollout_path)
+    return paths, selected
+
+
+def _plan_survivor_updates(
+    session: Session, surviving_rollout: RolloutRecord, errors: list[str]
+) -> list[DatabaseChange]:
+    changes: list[DatabaseChange] = []
+    desired = {
+        "rollout_path": str(surviving_rollout.path),
+        "archived": int(surviving_rollout.archived),
+        "archived_at": (
+            None
+            if not surviving_rollout.archived
+            else surviving_rollout.updated_at_ms // 1000
+        ),
+    }
+    for record in session.records:
+        try:
+            with open_sqlite_snapshot(record.db_path) as db:
+                columns = {row[1] for row in db.execute('PRAGMA table_info("threads")')}
+                row = db.execute('SELECT * FROM "threads" WHERE id = ?', (session.id,)).fetchone()
+                if row is None:
+                    continue
+                names = [item[1] for item in db.execute('PRAGMA table_info("threads")')]
+                current = dict(zip(names, row, strict=True))
+                for column, updated in desired.items():
+                    if column in columns and current[column] != updated:
+                        changes.append(
+                            DatabaseChange(
+                                path=record.db_path,
+                                table="threads",
+                                key_column="id",
+                                key=session.id,
+                                column=column,
+                                original=current[column],
+                                updated=updated,
+                                replacements=1,
+                            )
+                        )
+        except (OSError, RuntimeError, sqlite3.Error) as error:
+            errors.append(f"could not plan surviving rollout redirect in {record.db_path}: {error}")
+    return changes
+
+
+def build_deletion_plan(
+    home: Path, session_id: str, *, scope: SessionScope = "all"
+) -> DeletionPlan:
+    if scope not in {"active", "archived", "all"}:
+        raise ValueError(f"unknown session scope: {scope}")
     home = home.expanduser().resolve()
+    database_changes: list[DatabaseChange] = []
     database_actions: list[DatabaseAction] = []
     warnings: list[str] = []
     errors: list[str] = []
@@ -462,43 +625,41 @@ def build_deletion_plan(home: Path, session_id: str) -> DeletionPlan:
         except (OSError, RuntimeError, sqlite3.Error) as error:
             errors.append(f"could not discover sessions: {error}")
 
+    selected_paths: set[str] = set()
+    surviving_rollouts: tuple[RolloutRecord, ...] = ()
+    if session is not None:
+        selected_paths, selected_rollouts = _selected_rollouts(session, scope)
+        surviving_rollouts = tuple(
+            item for item in session.rollouts if item not in selected_rollouts
+        )
+
+    logical_delete = not surviving_rollouts
     for path in database_paths:
         try:
             with open_sqlite_snapshot(path) as db:
-                for table, action, where_clause, required_columns in _TABLE_ACTIONS:
-                    planned = _read_action(
-                        db,
-                        path,
-                        table,
-                        action,
-                        where_clause,
-                        required_columns,
-                        session_id,
-                    )
-                    if planned is not None:
-                        database_actions.append(planned)
+                if logical_delete:
+                    for table, action, where_clause, required_columns in _TABLE_ACTIONS:
+                        planned = _read_action(
+                            db,
+                            path,
+                            table,
+                            action,
+                            where_clause,
+                            required_columns,
+                            session_id,
+                        )
+                        if planned is not None:
+                            database_actions.append(planned)
                 references.extend(_thread_rollout_references(db))
         except (OSError, RuntimeError, sqlite3.Error) as error:
             errors.append(f"could not inspect database {path}: {error}")
 
-    thread_actions = [action for action in database_actions if action.table == "threads"]
-    if not thread_actions:
-        errors.append(f"session not found: {session_id}")
-        return DeletionPlan(
-            home=home,
-            session=None,
-            database_actions=tuple(database_actions),
-            file_deletions=(),
-            file_updates=(),
-            warnings=tuple(warnings),
-            errors=tuple(errors),
-        )
-
     if session is None:
-        errors.append(f"could not discover metadata for session: {session_id}")
+        errors.append(f"session not found; could not discover metadata: {session_id}")
         return DeletionPlan(
             home=home,
             session=None,
+            database_changes=(),
             database_actions=tuple(database_actions),
             file_deletions=(),
             file_updates=(),
@@ -506,28 +667,57 @@ def build_deletion_plan(home: Path, session_id: str) -> DeletionPlan:
             errors=tuple(errors),
         )
 
-    rollout_paths: set[str] = set()
-    for action in thread_actions:
-        if "rollout_path" not in action.columns:
-            continue
-        index = action.columns.index("rollout_path")
-        rollout_paths.update(str(row[index]) for row in action.original_rows if row[index])
+    if not selected_paths:
+        errors.append(f"no {scope} rollout found for session: {session_id}")
+        return DeletionPlan(
+            home=home,
+            session=session,
+            database_changes=(),
+            database_actions=tuple(database_actions),
+            file_deletions=(),
+            file_updates=(),
+            warnings=tuple(warnings),
+            errors=tuple(errors),
+        )
+
+    if surviving_rollouts:
+        surviving = max(
+            surviving_rollouts,
+            key=lambda item: (not item.archived, item.updated_at_ms, str(item.path)),
+        )
+        database_changes.extend(_plan_survivor_updates(session, surviving, errors))
     file_deletions = _plan_rollout_deletions(
         home,
         session_id,
-        rollout_paths,
+        selected_paths,
         tuple(references),
         warnings,
         errors,
     )
-    global_state = _plan_global_state(home, session_id, errors)
-    file_updates = () if global_state is None else (global_state,)
+    file_updates: list[FileChange] = []
+    if logical_delete:
+        other_cwds = {
+            item.cwd for item in discover_sessions(home) if item.id != session_id and item.cwd
+        }
+        for change in (
+            _plan_global_state(
+                home,
+                session_id,
+                errors,
+                cwd=session.cwd,
+                remove_workspace=session.cwd not in other_cwds,
+            ),
+            _plan_session_index(home, session_id, errors),
+        ):
+            if change is not None:
+                file_updates.append(change)
     return DeletionPlan(
         home=home,
         session=session,
+        database_changes=tuple(database_changes),
         database_actions=tuple(database_actions),
         file_deletions=tuple(file_deletions),
-        file_updates=file_updates,
+        file_updates=tuple(file_updates),
         warnings=tuple(warnings),
         errors=tuple(errors),
     )

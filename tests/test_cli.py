@@ -143,6 +143,71 @@ def test_noninteractive_apply_updates_data(tmp_path: Path) -> None:
     assert read_thread_cwd(state) == str(new)
 
 
+def test_noninteractive_apply_can_create_missing_destination(tmp_path: Path) -> None:
+    home = tmp_path / ".codex"
+    old = tmp_path / "old-project"
+    new = tmp_path / "new-project"
+    state, _ = create_codex_fixture(home, old)
+
+    exit_code = run(
+        [
+            "--old",
+            str(old),
+            "--new",
+            str(new),
+            "--create-new",
+            "--apply",
+            "--codex-home",
+            str(home),
+        ],
+        console=recording_console()[0],
+        process_checker=lambda: [],
+    )
+
+    assert exit_code == 0
+    assert new.is_dir()
+    assert read_thread_cwd(state) == str(new)
+
+
+def test_delete_project_applies_to_every_matching_session(tmp_path: Path) -> None:
+    fixture = create_two_session_cli_fixture(tmp_path)
+
+    exit_code = run(
+        [
+            "--delete-project",
+            str(fixture.old),
+            "--apply",
+            "--codex-home",
+            str(fixture.home),
+        ],
+        console=recording_console()[0],
+        process_checker=lambda: [],
+    )
+
+    assert exit_code == 0
+    assert thread_count(fixture.state, "thread-1") == 0
+    assert thread_count(fixture.state, "thread-2") == 0
+
+
+def test_doctor_repair_is_dry_run_by_default(tmp_path: Path) -> None:
+    home = tmp_path / ".codex"
+    old = tmp_path / "old-project"
+    create_codex_fixture(home, old)
+    index = home / "session_index.jsonl"
+    console, recorder = recording_console()
+
+    exit_code = run(
+        ["--doctor", "--repair", "--codex-home", str(home)],
+        console=console,
+    )
+
+    output = recorder.export_text()
+    assert exit_code == 0
+    assert "Doctor repair plan" in output
+    assert "Dry run only" in output
+    assert not index.exists()
+
+
 def test_noninteractive_delete_is_dry_run(tmp_path: Path) -> None:
     home = tmp_path / ".codex"
     old = tmp_path / "old-project"

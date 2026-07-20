@@ -5,6 +5,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from .session_files import (
+    RolloutRecord,
+    load_history_titles,
+    load_session_index,
+    read_rollout,
+    rollout_files,
+)
 from .sqlite_read import open_sqlite_snapshot
 
 SessionScope = Literal["active", "archived", "all"]
@@ -31,6 +38,24 @@ class Session:
     updated_at_ms: int
     rollout_path: str
     records: tuple[SessionRecord, ...]
+    rollouts: tuple[RolloutRecord, ...] = ()
+
+    @property
+    def issues(self) -> tuple[str, ...]:
+        result: list[str] = []
+        if not self.records:
+            result.append("rollout_without_database")
+        if self.records and not self.rollouts:
+            result.append("database_without_rollout")
+        if len(self.rollouts) > 1:
+            result.append("duplicate_rollouts")
+        known_paths = {str(item.path) for item in self.rollouts}
+        if self.records and known_paths and any(
+            record.rollout_path and record.rollout_path not in known_paths
+            for record in self.records
+        ):
+            result.append("rollout_path_mismatch")
+        return tuple(result)
 
 
 @dataclass(frozen=True)
@@ -110,23 +135,60 @@ def _read_records(path: Path) -> list[SessionRecord]:
 
 
 def discover_sessions(home: Path) -> list[Session]:
+    home = home.expanduser().resolve()
     grouped: dict[str, list[SessionRecord]] = {}
     for db_path in candidate_session_databases(home):
         for record in _read_records(db_path):
             grouped.setdefault(record.id, []).append(record)
 
+    rollout_groups: dict[str, list[RolloutRecord]] = {}
+    for path in rollout_files(home):
+        rollout = read_rollout(path, home)
+        if rollout is not None:
+            rollout_groups.setdefault(rollout.id, []).append(rollout)
+
+    index = load_session_index(home / "session_index.jsonl")
+    history_titles = load_history_titles(home / "history.jsonl")
     sessions = []
-    for session_id, records in grouped.items():
-        preferred = max(records, key=lambda record: (record.updated_at_ms, str(record.db_path)))
+    for session_id in grouped.keys() | rollout_groups.keys():
+        records = grouped.get(session_id, [])
+        rollouts = rollout_groups.get(session_id, [])
+        preferred_record = (
+            max(records, key=lambda record: (record.updated_at_ms, str(record.db_path)))
+            if records
+            else None
+        )
+        preferred_rollout = (
+            max(rollouts, key=lambda item: (not item.archived, item.updated_at_ms, str(item.path)))
+            if rollouts
+            else None
+        )
+        index_title = index.get(session_id, {}).get("thread_name", "")
+        if index_title == session_id:
+            index_title = ""
+        title = (
+            (preferred_record.title if preferred_record else "")
+            or (str(index_title) if index_title else "")
+            or (preferred_rollout.title if preferred_rollout else "")
+            or history_titles.get(session_id, "")
+        )
         sessions.append(
             Session(
                 id=session_id,
-                title=preferred.title,
-                cwd=preferred.cwd,
-                archived=preferred.archived,
-                updated_at_ms=preferred.updated_at_ms,
-                rollout_path=preferred.rollout_path,
+                title=title,
+                cwd=(preferred_record.cwd if preferred_record else "")
+                or (preferred_rollout.cwd if preferred_rollout else ""),
+                archived=(
+                    preferred_record.archived if preferred_record else preferred_rollout.archived
+                ),
+                updated_at_ms=max(
+                    preferred_record.updated_at_ms if preferred_record else 0,
+                    preferred_rollout.updated_at_ms if preferred_rollout else 0,
+                ),
+                rollout_path=(preferred_record.rollout_path if preferred_record else "")
+                or (str(preferred_rollout.path) if preferred_rollout else ""),
                 records=tuple(records),
+                rollouts=tuple(sorted(rollouts, key=lambda item: str(item.path))),
             )
         )
     return sorted(sessions, key=lambda session: (session.updated_at_ms, session.id), reverse=True)

@@ -14,6 +14,8 @@ from rich.text import Text
 from . import __version__
 from .delete import DeletionPlan, build_deletion_plan
 from .discovery import Session, SessionScope, StaleGroup, discover_sessions, stale_groups
+from .doctor import DoctorPlan, build_doctor_plan
+from .paths import PathMapper
 from .planner import MigrationPlan, build_plan
 from .storage import (
     ApplyError,
@@ -100,6 +102,18 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--old", help="Previous absolute project directory")
     parser.add_argument("--new", help="New absolute project directory")
     parser.add_argument("--delete", metavar="SESSION_ID", help="Delete one local Codex session")
+    parser.add_argument("--delete-project", metavar="PATH", help="Delete sessions under a project")
+    parser.add_argument(
+        "--delete-scope",
+        choices=("active", "archived", "all"),
+        default="all",
+        help="Limit deletion to active or archived rollout copies",
+    )
+    parser.add_argument("--doctor", action="store_true", help="Diagnose inconsistent session data")
+    parser.add_argument("--repair", action="store_true", help="Plan safe doctor repairs")
+    parser.add_argument(
+        "--create-new", action="store_true", help="Create a missing migration destination"
+    )
     parser.add_argument("--apply", action="store_true", help="Apply the displayed plan")
     parser.add_argument("--include-archived", action="store_true", help="Include archived sessions")
     parser.add_argument(
@@ -174,6 +188,12 @@ def render_deletion_plan(plan: DeletionPlan, console: Console, *, applying: bool
             f"{action.path.name}: {action.table} ({action.where_clause})",
             str(action.row_count),
         )
+    for change in plan.database_changes:
+        actions.add_row(
+            "update",
+            f"{change.path.name}: {change.table}.{change.column} [{change.key}]",
+            "1",
+        )
     for deletion in plan.file_deletions:
         actions.add_row("delete file", str(deletion.path), "")
     for update in plan.file_updates:
@@ -191,6 +211,44 @@ def render_deletion_plan(plan: DeletionPlan, console: Console, *, applying: bool
         console.print(f"[yellow]Warning:[/yellow] {warning}")
     for error in plan.errors:
         console.print(f"[red]Error:[/red] {error}")
+
+
+def render_doctor_plan(plan: DoctorPlan, console: Console, *, show_repairs: bool) -> None:
+    console.rule("Doctor repair plan" if show_repairs else "Doctor report")
+    issues = Table(title=f"Issues ({len(plan.issues)})", box=None)
+    issues.add_column("Session")
+    issues.add_column("Issue")
+    issues.add_column("Repairable")
+    issues.add_column("Detail", overflow="fold")
+    for issue in plan.issues:
+        issues.add_row(
+            issue.session_id,
+            issue.code,
+            "yes" if issue.repairable else "no",
+            issue.detail,
+        )
+    console.print(issues)
+    if show_repairs:
+        console.print(
+            f"Planned repairs: {len(plan.database_changes)} database field(s), "
+            f"{len(plan.file_changes)} file(s)."
+        )
+    for error in plan.errors:
+        console.print(f"[red]Error:[/red] {error}")
+
+
+def _sessions_for_project(home: Path, project: str, scope: SessionScope) -> list[Session]:
+    matcher = PathMapper(project, project)
+    result: list[Session] = []
+    for session in discover_sessions(home):
+        if matcher.map_path(session.cwd) is None:
+            continue
+        if scope == "active" and not any(not item.archived for item in session.rollouts):
+            continue
+        if scope == "archived" and not any(item.archived for item in session.rollouts):
+            continue
+        result.append(session)
+    return result
 
 
 def _apply_deletion_plan(
@@ -226,16 +284,87 @@ def run(
     args = parser.parse_args(argv)
     console = console or Console()
     prompts = prompts or PromptAdapter()
-    if args.delete is not None and (args.old or args.new):
-        parser.error("--delete cannot be combined with --old or --new")
+    destructive_modes = sum(
+        bool(value) for value in (args.delete is not None, args.delete_project, args.doctor)
+    )
+    if destructive_modes > 1:
+        parser.error("--delete, --delete-project, and --doctor are mutually exclusive")
+    if (args.delete is not None or args.delete_project or args.doctor) and (args.old or args.new):
+        parser.error("delete and doctor options cannot be combined with --old or --new")
     if args.delete is not None and not args.delete.strip():
         parser.error("--delete requires a non-empty session ID")
     if bool(args.old) != bool(args.new):
         parser.error("--old and --new must be supplied together")
+    if args.repair and not args.doctor:
+        parser.error("--repair requires --doctor")
+    if args.doctor and args.apply and not args.repair:
+        parser.error("--doctor --apply requires --repair")
+    if args.create_new and not args.old:
+        parser.error("--create-new requires --old and --new")
+
+    if args.doctor:
+        try:
+            doctor_plan = build_doctor_plan(args.codex_home)
+        except (OSError, RuntimeError, ValueError) as error:
+            console.print(f"[red]Error:[/red] {error}")
+            return 1
+        render_doctor_plan(doctor_plan, console, show_repairs=bool(args.repair))
+        if doctor_plan.errors:
+            return 1
+        if not args.repair or not doctor_plan.has_repairs:
+            return 0
+        if not args.apply:
+            console.print("Dry run only; no data was modified.")
+            return 0
+        try:
+            result = apply_plan(doctor_plan.migration_plan(), process_checker=process_checker)
+        except (
+            PlanValidationError,
+            ConcurrentChangeError,
+            ProcessRunningError,
+            ApplyError,
+        ) as error:
+            console.print(f"[red]Repair failed:[/red] {error}")
+            return 1
+        console.print("[green]Repairs applied and verified.[/green]")
+        if result.backup_dir:
+            console.print(f"Backup: {result.backup_dir}")
+        return 0
+
+    if args.delete_project:
+        try:
+            sessions = _sessions_for_project(
+                args.codex_home, args.delete_project, args.delete_scope
+            )
+            plans = [
+                build_deletion_plan(args.codex_home, session.id, scope=args.delete_scope)
+                for session in sessions
+            ]
+        except (OSError, RuntimeError, ValueError) as error:
+            console.print(f"[red]Error:[/red] {error}")
+            return 1
+        if not plans:
+            console.print("No matching sessions found.")
+            return 0
+        for plan in plans:
+            render_deletion_plan(plan, console, applying=bool(args.apply))
+        if any(plan.errors for plan in plans):
+            return 1
+        if not args.apply:
+            console.print(f"Dry run only; {len(plans)} session(s) would be deleted.")
+            return 0
+        for session in sessions:
+            plan = build_deletion_plan(args.codex_home, session.id, scope=args.delete_scope)
+            result = _apply_deletion_plan(plan, console, process_checker)
+            if result:
+                return result
+        return 0
 
     if args.delete is not None:
         try:
-            deletion_plan = build_deletion_plan(args.codex_home, args.delete)
+            deletion_plan = build_deletion_plan(
+                args.codex_home, args.delete, scope=args.delete_scope
+            )
         except (OSError, ValueError) as error:
             console.print(f"[red]Error:[/red] {error}")
             return 1
@@ -331,7 +460,11 @@ def run(
         console.print("Dry run only; no data was modified.")
         return 0
     try:
-        result = apply_plan(plan, process_checker=process_checker)
+        result = apply_plan(
+            plan,
+            process_checker=process_checker,
+            create_destination=bool(args.create_new),
+        )
     except (PlanValidationError, ConcurrentChangeError, ProcessRunningError, ApplyError) as error:
         console.print(f"[red]Apply failed:[/red] {error}")
         if isinstance(error, ApplyError):

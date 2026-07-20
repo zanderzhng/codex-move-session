@@ -32,8 +32,8 @@ class DatabaseChange:
     key_column: str
     key: str
     column: str
-    original: str
-    updated: str
+    original: Any
+    updated: Any
     replacements: int
 
 
@@ -45,6 +45,7 @@ class FileChange:
     updated: bytes
     original_digest: str
     replacements: int
+    created: bool = False
 
 
 @dataclass(frozen=True)
@@ -444,6 +445,8 @@ def build_plan(
                     "project-order",
                     "electron-workspace-root-labels",
                     "thread-workspace-root-hints",
+                    "sidebar-project-thread-orders",
+                    "electron-persisted-atom-state",
                 ),
                 errors=errors,
             )
