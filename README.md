@@ -48,7 +48,7 @@ For scripts, provide both paths. This is a dry-run and does not write anything:
 codex-move-session --old /previous/project --new /current/project
 ```
 
-Close Codex, review the dry-run, then apply the same migration:
+Close Codex and ChatGPT, review the dry-run, then apply the same migration:
 
 ```console
 codex-move-session --old /previous/project --new /current/project --apply
@@ -142,14 +142,16 @@ treated as descendants of `/project`.
 
 ## Safety
 
-Dry-run is always the default. Apply mode:
+Dry-run is always the default. Every operational command, including dry-run and doctor, refuses to
+start while a Codex, Codex app-server, ChatGPT, or related helper process is running. This prevents
+the preview itself from racing with session discovery. Apply mode also checks again immediately
+before writing, then:
 
-1. Refuses to run while a Codex desktop, CLI, or app-server process is detected.
-2. Verifies that files and database values did not change after planning.
-3. Creates a timestamped touched-data backup under `CODEX_HOME/backups/`.
-4. Uses SQLite transactions and atomic file replacement.
-5. Runs post-write database and content verification.
-6. Restores every touched store if writing or verification fails.
+1. Verifies that files and database values did not change after planning.
+2. Creates a timestamped touched-data backup under `CODEX_HOME/backups/`.
+3. Uses SQLite transactions and atomic file replacement.
+4. Runs post-write database and content verification.
+5. Restores every touched store if writing or verification fails.
 
 Each backup contains `manifest.json`, standalone SQLite snapshots, and the original content of every
 changed file. Backups can contain private conversations and local paths; do not publish them.

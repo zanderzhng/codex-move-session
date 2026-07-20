@@ -21,6 +21,7 @@ from .storage import (
     ApplyError,
     ConcurrentChangeError,
     PlanValidationError,
+    ProcessInspectionError,
     ProcessRunningError,
     apply_deletion,
     apply_plan,
@@ -301,6 +302,18 @@ def run(
         parser.error("--doctor --apply requires --repair")
     if args.create_new and not args.old:
         parser.error("--create-new requires --old and --new")
+
+    try:
+        running = process_checker()
+    except ProcessInspectionError as error:
+        console.print(f"[red]Refusing to run:[/red] {error}")
+        return 1
+    if running:
+        console.print(
+            "[red]Refusing to run:[/red] Close all Codex and ChatGPT processes first: "
+            + ", ".join(running)
+        )
+        return 1
 
     if args.doctor:
         try:

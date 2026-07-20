@@ -60,6 +60,10 @@ class ProcessRunningError(RuntimeError):
     pass
 
 
+class ProcessInspectionError(ProcessRunningError):
+    pass
+
+
 class ApplyError(RuntimeError):
     def __init__(self, message: str, backup_dir: Path) -> None:
         super().__init__(message)
@@ -187,21 +191,33 @@ def _open_safe_parent(home: Path, path: Path, *, rollout: bool) -> tuple[int, st
         ) from error
 
 
+def _is_conflicting_process_name(name: str) -> bool:
+    folded = name.strip().casefold()
+    if not folded or folded.startswith("codex-move-session"):
+        return False
+    return (
+        folded in {"codex", "codex.exe", "codex-app-server", "codex-app-server.exe"}
+        or folded.startswith("codex ")
+        or folded in {"chatgpt", "chatgpt.exe"}
+        or folded.startswith("chatgpt ")
+    )
+
+
 def running_codex_processes() -> list[str]:
     found: set[str] = set()
     current_pid = os.getpid()
-    for process in psutil.process_iter(["pid", "name"]):
-        try:
-            if process.info["pid"] == current_pid:
+    try:
+        for process in psutil.process_iter(["pid", "name"]):
+            try:
+                if process.info["pid"] == current_pid:
+                    continue
+                name = (process.info.get("name") or "").strip()
+            except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
                 continue
-            name = (process.info.get("name") or "").strip()
-        except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
-            continue
-        folded = name.casefold()
-        if folded in {"codex", "codex.exe", "codex-app-server", "codex-app-server.exe"} or (
-            folded.startswith("codex ") and "move-session" not in folded
-        ):
-            found.add(name)
+            if _is_conflicting_process_name(name):
+                found.add(name)
+    except (OSError, psutil.Error) as error:
+        raise ProcessInspectionError(f"Could not inspect running processes: {error}") from error
     return sorted(found)
 
 
@@ -1080,7 +1096,9 @@ def apply_plan(
         raise PlanValidationError(f"destination directory does not exist: {plan.new}")
     running = process_checker()
     if running:
-        raise ProcessRunningError("Close Codex before applying changes: " + ", ".join(running))
+        raise ProcessRunningError(
+            "Close Codex and ChatGPT before applying changes: " + ", ".join(running)
+        )
     if not plan.has_changes:
         return ApplyResult(backup_dir=None, database_changes=0, file_changes=0)
     _validate_unchanged(plan)
@@ -1164,7 +1182,9 @@ def apply_deletion(
         raise PlanValidationError("deletion plan contains errors: " + "; ".join(plan.errors))
     running = process_checker()
     if running:
-        raise ProcessRunningError("Close Codex before applying changes: " + ", ".join(running))
+        raise ProcessRunningError(
+            "Close Codex and ChatGPT before applying changes: " + ", ".join(running)
+        )
     if not plan.has_changes:
         raise PlanValidationError("deletion plan contains no changes")
     file_identities = _validate_deletion_unchanged(plan)
@@ -1177,7 +1197,9 @@ def apply_deletion(
         _validate_locked_database_set(plan, databases)
         running = process_checker()
         if running:
-            raise ProcessRunningError("Close Codex before applying changes: " + ", ".join(running))
+            raise ProcessRunningError(
+                "Close Codex and ChatGPT before applying changes: " + ", ".join(running)
+            )
         for path, changes in _group_database_changes(plan.database_changes).items():
             db = databases[path]
             for change in changes:

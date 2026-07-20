@@ -106,6 +106,7 @@ def test_noninteractive_is_dry_run_and_describes_changes(tmp_path: Path) -> None
     exit_code = run(
         ["--old", str(old), "--new", str(new), "--codex-home", str(home)],
         console=console,
+        process_checker=lambda: [],
     )
 
     output = recorder.export_text()
@@ -199,6 +200,7 @@ def test_doctor_repair_is_dry_run_by_default(tmp_path: Path) -> None:
     exit_code = run(
         ["--doctor", "--repair", "--codex-home", str(home)],
         console=console,
+        process_checker=lambda: [],
     )
 
     output = recorder.export_text()
@@ -208,13 +210,41 @@ def test_doctor_repair_is_dry_run_by_default(tmp_path: Path) -> None:
     assert not index.exists()
 
 
+def test_startup_refuses_chatgpt_before_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / ".codex"
+    console, recorder = recording_console()
+
+    def unexpected_discovery(_home: Path) -> list[object]:
+        raise AssertionError("discovery must not run while ChatGPT is active")
+
+    monkeypatch.setattr(cli, "discover_sessions", unexpected_discovery)
+
+    exit_code = run(
+        ["--doctor", "--codex-home", str(home)],
+        console=console,
+        process_checker=lambda: ["ChatGPT Helper (Renderer)"],
+    )
+
+    output = recorder.export_text()
+    assert exit_code == 1
+    assert "Refusing to run" in output
+    assert "ChatGPT Helper (Renderer)" in output
+    assert not home.exists()
+
+
 def test_noninteractive_delete_is_dry_run(tmp_path: Path) -> None:
     home = tmp_path / ".codex"
     old = tmp_path / "old-project"
     state, rollout = create_codex_fixture(home, old)
     console, recorder = recording_console()
 
-    exit_code = run(["--delete", "thread-1", "--codex-home", str(home)], console=console)
+    exit_code = run(
+        ["--delete", "thread-1", "--codex-home", str(home)],
+        console=console,
+        process_checker=lambda: [],
+    )
 
     output = recorder.export_text()
     assert exit_code == 0
@@ -294,6 +324,7 @@ def test_interactive_discovery_error_is_reported(
         ["--codex-home", str(tmp_path / ".codex")],
         console=console,
         prompts=FakePrompts("/old", "/new"),
+        process_checker=lambda: [],
     )
 
     assert exit_code == 1

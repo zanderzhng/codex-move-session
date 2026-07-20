@@ -10,9 +10,42 @@ from codex_move_session.planner import build_plan
 from codex_move_session.storage import (
     ApplyError,
     ConcurrentChangeError,
+    ProcessInspectionError,
     ProcessRunningError,
+    _is_conflicting_process_name,
     apply_plan,
 )
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Codex",
+        "codex.exe",
+        "codex-app-server",
+        "Codex Helper (GPU)",
+        "ChatGPT",
+        "ChatGPT.exe",
+        "ChatGPT Helper (Renderer)",
+    ],
+)
+def test_conflicting_process_names(name: str) -> None:
+    assert _is_conflicting_process_name(name)
+
+
+@pytest.mark.parametrize("name", ["", "python", "codex-move-session", "codex-project"])
+def test_non_conflicting_process_names(name: str) -> None:
+    assert not _is_conflicting_process_name(name)
+
+
+def test_process_inspection_failure_refuses_to_guess(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_process_iter(_attrs: list[str]) -> list[object]:
+        raise PermissionError("process list denied")
+
+    monkeypatch.setattr(storage.psutil, "process_iter", fail_process_iter)
+
+    with pytest.raises(ProcessInspectionError, match="Could not inspect"):
+        storage.running_codex_processes()
 
 
 def read_thread_cwd(state: Path) -> str:
